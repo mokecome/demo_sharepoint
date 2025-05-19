@@ -1,0 +1,41 @@
+{
+    "rules": [
+        {
+            "name": "ai_documents",
+            "conditions": {
+                "keywords": ["AI", "Artificial Intelligence"],
+                "content_tags": ["AI Marketing PC"],
+                "file_types": ["*"]
+            },
+            "target_folder": "/AI_Related"
+        },
+        {
+            "name": "xlsx_documents",
+            "conditions": {
+                "file_types": [".xlsx"]
+            },
+            "target_folder": "/Xlsx"
+        },
+        {
+            "name": "docx_documents",
+            "conditions": {
+                "file_types": [".docx"]
+            },
+            "target_folder": "/Docx"
+        },
+        {
+            "name": "pdf_documents",
+            "conditions": {
+                "file_types": [".pdf"]
+            },
+            "target_folder": "/Pdf"
+        }
+    ],
+    "default_folder": "Unclassified",
+    "settings": {
+        "case_sensitive": false,
+        "create_folders": true,
+        "logging": true
+    }
+}
+
