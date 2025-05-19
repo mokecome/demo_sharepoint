@@ -15,11 +15,54 @@ from typing import Dict, List, Any, Optional, Tuple
 from document_classifier import AutoDocumentClassifier
 from sharepoint_utils import SharePointClient, normalize_path, extract_text_from_docx, extract_text_from_xlsx, extract_text_from_pptx, extract_text_from_dxf, extract_text_from_zip
 from breakpoint_resume_log import SharePointUploadLogger
+from urllib.parse import quote
+from pathlib import Path
 
 sp_client = None
 # List of fields to filter when using SharePointClient methods
 fiter_list= ['id', 'name', 'path', 'web_url', 'created_time', 'modified_time', 'size', '@odata.context', '@odata.etag', 'MediaServiceImageTags', 'ContentType', 'Created', 'AuthorLookupId', 'Modified', 'EditorLookupId', 'LinkFilenameNoMenu', 'LinkFilename', 'ItemChildCount', 'FolderChildCount', 'Edit', 'ParentVersionStringLookupId', 'ParentLeafNameLookupId', 'type', 'child_count', 'children','AppAuthorLookupId', 'AppEditorLookupId', 'file_type', 'hash', 'download_url','DocIcon','FileSizeDisplay']
 
+
+def normalize_path(path: str) -> str:
+    """
+    Normalize file path for consistent handling across platforms
+    Args:
+        path: Input file path
+    Returns:
+        str: Normalized path with forward slashes
+    """
+    if not path:
+        return ""
+    return str(Path(path).resolve()).replace('\\', '/').strip('/')
+
+def encode_url_path(path: str) -> str:
+    """
+    Properly encode path for URL usage
+    Args:
+        path: Input path
+    Returns:
+        str: URL encoded path
+    """
+    if not path:
+        return ""
+    # Split path into parts and encode each part separately
+    parts = path.split('/')
+    encoded_parts = [quote(part) for part in parts]
+    return '/'.join(encoded_parts)
+
+def get_relative_path(path: str, base_dir: str = 'target') -> str:
+    """
+    Get relative path from base directory
+    Args:
+        path: Input path
+        base_dir: Base directory to calculate relative path from
+    Returns:
+        str: Relative path
+    """
+    try:
+        return os.path.relpath(path, base_dir).replace('\\', '/')
+    except ValueError:
+        return path.replace('\\', '/')
 
 def get_field_info_for_file(file_path: str) -> Tuple[str, str]:
     """
@@ -30,9 +73,9 @@ def get_field_info_for_file(file_path: str) -> Tuple[str, str]:
         Tuple[str str]: (FIELD_NAME, FIELD_VALUE)
     """
     try:
-        # Get filename and relative path
+        # Get filename and normalize path
         file_name = os.path.basename(file_path)
-        normalized_path = file_path.replace('\\', '/').strip('/')
+        normalized_path = normalize_path(file_path)
         logger.info(f"Processing file: {file_path}")
 
         # Read merged_sharepoint_data.json
@@ -42,7 +85,7 @@ def get_field_info_for_file(file_path: str) -> Tuple[str, str]:
 
         # Find matching tag info - first try full path match
         for item in merged_data:
-            item_path = item.get("path", "").replace('\\', '/').strip('/')
+            item_path = normalize_path(item.get("path", ""))
             if item_path == normalized_path or item.get("name", "") == normalized_path:
                 # Use content_tag as tag value
                 tag = item.get("content_tag", item.get("tag", "unknown_tag"))
@@ -1377,9 +1420,8 @@ with col3:
                 # Define function to upload single file (with exponential backoff)
                 def upload_single_file(file_tuple, max_retries=3):
                     local_path, sp_path = file_tuple
-                    # filename = os.path.basename(local_path)
-
-                    # 1. Ensure the folder exists
+                    
+                    # 1. 确保文件夹存在
                     folder_path = os.path.dirname(sp_path)
                     if folder_path and folder_path not in created_folders:
                         try:
@@ -1398,9 +1440,17 @@ with col3:
                                 stats['error'] += 1
                             return False
 
-                    # 2. File upload logic (separate block, reduce nesting)
-                    file_id = None
-                    error_message = None
+                    # 2. 获取文件大小
+                    file_size = os.path.getsize(local_path)
+                    
+                    # 3. 根据文件大小选择上传方式
+                    if file_size < 4 * 1024 * 1024:  # 小于4MB使用普通上传
+                        return upload_small_file(local_path, sp_path, max_retries)
+                    else:  # 大于4MB使用分块上传
+                        return upload_large_file(local_path, sp_path, file_size, max_retries)
+
+                def upload_small_file(local_path, sp_path, max_retries=3):
+                    """上传小文件（<4MB）"""
                     for attempt in range(max_retries):
                         try:
                             url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{sp_path}:/content"
@@ -1419,7 +1469,7 @@ with col3:
                                     "success",
                                     file_id=file_id
                                 )
-                                break
+                                return file_id
                             if attempt < max_retries - 1:
                                 wait_time = (2 ** attempt) + random.random()
                                 logger.warning(f"⚠️ Upload retry ({attempt+1}/{max_retries}): {res.status_code} - Waiting {wait_time:.1f} seconds")
@@ -1436,7 +1486,7 @@ with col3:
                         except Exception as e:
                             if attempt < max_retries - 1:
                                 wait_time = (2 ** attempt) + random.random()
-                                logger.warning(f"⚠️ Upload error, retry ({attempt+1}/{max_retries}): {str(e)} - Waiting {wait_time:.1f} seconds")
+                                logger.warning(f"⚠️ Upload error, retry ({attempt+1}/{max_retries}): {str(e)}")
                                 time.sleep(wait_time)
                             else:
                                 error_message = f"Upload failed: {str(e)}"
@@ -1447,135 +1497,177 @@ with col3:
                                     "error",
                                     error=error_message
                                 )
-                    # 3. Tag setting logic (separate block, reduce nesting)
-                    if file_id:
+                    return None
+
+                def upload_large_file(local_path, sp_path, file_size, max_retries=3):
+                    """分块上传大文件（>=4MB）"""
+                    # 1. 创建上传会话
+                    upload_session = None
+                    for attempt in range(max_retries):
                         try:
-                            rel_file_path = os.path.relpath(local_path, 'target')
-                            normalized_path = rel_file_path.replace('\\', '/').strip('/')
-                            field_value = None
-                            if normalized_path in tag_cache:
-                                field_value = tag_cache[normalized_path]
-                            elif os.path.basename(normalized_path) in tag_cache:
-                                field_value = tag_cache[os.path.basename(normalized_path)]
-                            if not field_value:
-                                field_name, field_value = get_field_info_for_file(rel_file_path)
-                            else:
-                                field_name = "content_tag"
-                            patch_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{file_id}/listItem/fields"
-                            patch_headers = {
+                            create_session_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{sp_path}:/createUploadSession"
+                            create_session_headers = {
                                 "Authorization": f"Bearer {access_token}",
                                 "Content-Type": "application/json"
                             }
-                            patch_body = {field_name: field_value}
+                            create_session_body = {
+                                "@microsoft.graph.conflictBehavior": "replace",
+                                "description": "Large file upload"
+                            }
+                            
+                            create_session_res = requests.post(
+                                create_session_url,
+                                headers=create_session_headers,
+                                json=create_session_body
+                            )
+                            
+                            if create_session_res.status_code == 200:
+                                upload_session = create_session_res.json()
+                                break
+                            elif attempt < max_retries - 1:
+                                wait_time = (2 ** attempt) + random.random()
+                                logger.warning(f"⚠️ Create session retry ({attempt+1}/{max_retries}): {create_session_res.status_code}")
+                                time.sleep(wait_time)
+                            else:
+                                error_message = f"Create upload session failed: {create_session_res.status_code} - {create_session_res.text}"
+                                logger.error(f"❌ {error_message}")
+                                upload_logger.update_file_status(
+                                    local_path,
+                                    sp_path,
+                                    "error",
+                                    error=error_message
+                                )
+                                return None
+                        except Exception as e:
+                            if attempt < max_retries - 1:
+                                wait_time = (2 ** attempt) + random.random()
+                                logger.warning(f"⚠️ Create session error, retry ({attempt+1}/{max_retries}): {str(e)}")
+                                time.sleep(wait_time)
+                            else:
+                                error_message = f"Create upload session failed: {str(e)}"
+                                logger.error(f"❌ {error_message}")
+                                upload_logger.update_file_status(
+                                    local_path,
+                                    sp_path,
+                                    "error",
+                                    error=error_message
+                                )
+                                return None
+
+                    if not upload_session:
+                        return None
+
+                    # 2. 分块上传
+                    upload_url = upload_session['uploadUrl']
+                    
+                    # 根据文件大小动态调整分块大小
+                    if file_size > 100 * 1024 * 1024:  # 大于100MB
+                        chunk_size = 10 * 1024 * 1024  # 10MB chunks
+                    else:
+                        chunk_size = 4 * 1024 * 1024  # 4MB chunks
+                    
+                    total_chunks = (file_size + chunk_size - 1) // chunk_size
+                    uploaded_bytes = 0
+                    start_time = time.time()
+                    
+                    with open(local_path, 'rb') as f:
+                        for chunk_index in range(total_chunks):
+                            start_byte = chunk_index * chunk_size
+                            end_byte = min(start_byte + chunk_size, file_size)
+                            chunk_size_actual = end_byte - start_byte
+                            
+                            # 读取当前块
+                            chunk_data = f.read(chunk_size_actual)
+                            
+                            # 上传当前块
                             for attempt in range(max_retries):
                                 try:
-                                    patch_res = requests.patch(patch_url, headers=patch_headers, json=patch_body, timeout=30)
-                                    if patch_res.status_code == 200:
-                                        logger.info(f"✅ Tag set successfully: {local_path} -> {field_value}")
+                                    headers = {
+                                        "Content-Length": str(chunk_size_actual),
+                                        "Content-Range": f"bytes {start_byte}-{end_byte-1}/{file_size}"
+                                    }
+                                    
+                                    upload_res = requests.put(
+                                        upload_url,
+                                        headers=headers,
+                                        data=chunk_data
+                                    )
+                                    
+                                    if upload_res.status_code in [201, 202]:
+                                        # 上传完成
+                                        file_id = upload_res.json().get('id')
+                                        upload_logger.update_file_status(
+                                            local_path,
+                                            sp_path,
+                                            "success",
+                                            file_id=file_id
+                                        )
+                                        return file_id
+                                    elif upload_res.status_code == 404:
+                                        # 会话过期，需要重新创建
+                                        logger.warning("Upload session expired, retrying...")
+                                        return upload_large_file(local_path, sp_path, file_size, max_retries)
+                                    elif upload_res.status_code == 416:
+                                        # 范围错误，可能是块已上传，继续下一个块
+                                        logger.warning(f"Chunk {chunk_index + 1}/{total_chunks} already uploaded, continuing...")
                                         break
-                                    if attempt < max_retries - 1:
+                                    elif attempt < max_retries - 1:
                                         wait_time = (2 ** attempt) + random.random()
+                                        logger.warning(f"⚠️ Chunk upload retry ({attempt+1}/{max_retries}): {upload_res.status_code}")
                                         time.sleep(wait_time)
                                     else:
-                                        logger.error(f"❌ Tag set failed: {patch_res.status_code} - {patch_res.text}")
+                                        error_message = f"Chunk upload failed: {upload_res.status_code} - {upload_res.text}"
+                                        logger.error(f"❌ {error_message}")
+                                        upload_logger.update_file_status(
+                                            local_path,
+                                            sp_path,
+                                            "error",
+                                            error=error_message
+                                        )
+                                        return None
                                 except Exception as e:
                                     if attempt < max_retries - 1:
                                         wait_time = (2 ** attempt) + random.random()
+                                        logger.warning(f"⚠️ Chunk upload error, retry ({attempt+1}/{max_retries}): {str(e)}")
                                         time.sleep(wait_time)
                                     else:
-                                        logger.error(f"❌ Tag set failed: {str(e)}")
-                        except Exception as e:
-                            logger.error(f"❌ Error processing tag: {str(e)}")
-
-                    # 4. Unified statistics update
-                    with counter_lock:
-                        stats['processed'] += 1
-                        if file_id:
-                            stats['success'] += 1
-                        else:
-                            stats['error'] += 1
-                    return file_id is not None
-
-                # Define function to create folder
-                def create_folder(folder_path, drive_id, access_token, max_retries=3):
-                    if not folder_path:
-                        return True
-
-                    # Check if already created
-                    if folder_path in created_folders:
-                        return True
-
-                    # Ensure parent folder exists
-                    parent_path = os.path.dirname(folder_path)
-                    if parent_path and parent_path not in created_folders:
-                        create_folder(parent_path, drive_id, access_token)
-                        created_folders.add(parent_path)
-
-                    # Create current folder
-                    encoded_path = folder_path.replace(" ", "%20")
-                    url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{encoded_path}"
-
-                    for attempt in range(max_retries):
-                        try:
-                            # Check folder exists
-                            check_res = requests.get(
-                                url,
-                                headers={"Authorization": f"Bearer {access_token}"},
-                                timeout=30
+                                        error_message = f"Chunk upload failed: {str(e)}"
+                                        logger.error(f"❌ {error_message}")
+                                        upload_logger.update_file_status(
+                                            local_path,
+                                            sp_path,
+                                            "error",
+                                            error=error_message
+                                        )
+                                        return None
+                            
+                            # 更新上传进度
+                            uploaded_bytes += chunk_size_actual
+                            elapsed_time = time.time() - start_time
+                            speed = uploaded_bytes / elapsed_time if elapsed_time > 0 else 0
+                            
+                            # 计算进度百分比
+                            progress = (uploaded_bytes / file_size) * 100
+                            
+                            # 格式化速度和大小显示
+                            speed_str = f"{speed/1024/1024:.1f} MB/s"
+                            uploaded_str = f"{uploaded_bytes/1024/1024:.1f} MB"
+                            total_str = f"{file_size/1024/1024:.1f} MB"
+                            
+                            # 更新日志
+                            logger.info(f"Uploading {os.path.basename(local_path)}: {progress:.1f}% ({uploaded_str}/{total_str}) - {speed_str}")
+                            
+                            # 更新上传状态
+                            upload_logger.update_file_status(
+                                local_path,
+                                sp_path,
+                                "uploading",
+                                progress=progress,
+                                uploaded_bytes=uploaded_bytes,
+                                total_bytes=file_size
                             )
-
-                            if check_res.status_code == 200:
-                                # Folder exists
-                                return True
-
-                            # Create folder
-                            create_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root/children"
-                            create_headers = {
-                                "Authorization": f"Bearer {access_token}",
-                                "Content-Type": "application/json"
-                            }
-                            create_body = {
-                                "name": os.path.basename(folder_path),
-                                "folder": {},
-                                "@microsoft.graph.conflictBehavior": "replace"
-                            }
-
-                            if parent_path:
-                                # If there is parent folder, create in parent folder
-                                encoded_parent = parent_path.replace(" ", "%20")
-                                parent_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{encoded_parent}"
-                                parent_res = requests.get(parent_url, headers={"Authorization": f"Bearer {access_token}"})
-                                if parent_res.status_code == 200:
-                                    parent_id = parent_res.json().get("id")
-                                    create_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{parent_id}/children"
-
-                            create_res = requests.post(
-                                create_url,
-                                headers=create_headers,
-                                json=create_body,
-                                timeout=30
-                            )
-
-                            if create_res.status_code in [200, 201]:
-                                logger.info(f"✅ Folder created successfully: {folder_path}")
-                                return True
-                            elif attempt < max_retries - 1:
-                                # Exponential backoff
-                                wait_time = (2 ** attempt) + random.random()
-                                time.sleep(wait_time)
-                            else:
-                                logger.error(f"❌ Folder creation failed: {create_res.status_code} - {create_res.text}")
-                                return False
-                        except Exception as e:
-                            if attempt < max_retries - 1:
-                                # Exponential backoff
-                                wait_time = (2 ** attempt) + random.random()
-                                time.sleep(wait_time)
-                            else:
-                                logger.error(f"❌ Folder creation error: {str(e)}")
-                                return False
-
-                    return False
+                    
+                    return None
 
                 # Display progress
                 progress_bar = st.progress(0)
@@ -1598,12 +1690,13 @@ with col3:
                             future.result()  # Get result (exceptions will be raised here)
                             # Display progress
                             with counter_lock:
-                                progress = (stats['processed'] / stats['total']) * 100
-                                progress_bar.progress(progress)
+                                # Calculate progress as decimal (0-1)
+                                progress = stats['processed'] / stats['total']
                                 # Calculate percentage for display
-                                progress_percentage = (stats['processed'] / stats['total']) * 100
-                                # But use 0-1 value for the progress bar
-                                progress_bar.progress(stats['processed'] / stats['total'])
+                                progress_percentage = progress * 100
+                                # Update progress bar with decimal value
+                                progress_bar.progress(progress)
+                                # Update status text with percentage
                                 status_text.text(f"Progress: {progress_percentage:.1f}% ({stats['processed']}/{stats['total']})")
                         except Exception as e:
                             logger.error(f"❌ Task execution failed: {str(e)}")
