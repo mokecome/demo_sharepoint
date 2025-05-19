@@ -1,0 +1,1760 @@
+import streamlit as st
+import requests
+import time
+import json
+import logging
+import os
+import pandas as pd
+import shutil
+import threading
+import queue
+import concurrent.futures
+import datetime
+import random
+from typing import Dict, List, Any, Optional, Tuple
+from document_classifier import AutoDocumentClassifier
+from sharepoint_utils import SharePointClient, normalize_path, extract_text_from_docx, extract_text_from_xlsx, extract_text_from_pptx, extract_text_from_dxf, extract_text_from_zip
+from breakpoint_resume_log import SharePointUploadLogger
+
+sp_client = None
+# List of fields to filter when using SharePointClient methods
+fiter_list= ['id', 'name', 'path', 'web_url', 'created_time', 'modified_time', 'size', '@odata.context', '@odata.etag', 'MediaServiceImageTags', 'ContentType', 'Created', 'AuthorLookupId', 'Modified', 'EditorLookupId', 'LinkFilenameNoMenu', 'LinkFilename', 'ItemChildCount', 'FolderChildCount', 'Edit', 'ParentVersionStringLookupId', 'ParentLeafNameLookupId', 'type', 'child_count', 'children','AppAuthorLookupId', 'AppEditorLookupId', 'file_type', 'hash', 'download_url','DocIcon','FileSizeDisplay']
+
+
+def get_field_info_for_file(file_path: str) -> Tuple[str, str]:
+    """
+    Get corresponding tag information based on file path
+    Args:
+        file_path: File path, can be relative or absolute path
+    Returns:
+        Tuple[str str]: (FIELD_NAME, FIELD_VALUE)
+    """
+    try:
+        # Get filename and relative path
+        file_name = os.path.basename(file_path)
+        normalized_path = file_path.replace('\\', '/').strip('/')
+        logger.info(f"Processing file: {file_path}")
+
+        # Read merged_sharepoint_data.json
+        merged_data_path = "tag_result/merged_sharepoint_data.json"
+        with open(merged_data_path, "r", encoding="utf-8") as f:
+            merged_data = json.load(f)
+
+        # Find matching tag info - first try full path match
+        for item in merged_data:
+            item_path = item.get("path", "").replace('\\', '/').strip('/')
+            if item_path == normalized_path or item.get("name", "") == normalized_path:
+                # Use content_tag as tag value
+                tag = item.get("content_tag", item.get("tag", "unknown_tag"))
+                return "content_tag", tag
+
+        # If full path match fails, try filename only match
+        for item in merged_data:
+            if item.get("name", "") == file_name or os.path.basename(item.get("path", "")) == file_name:
+                # Use content_tag as tag value
+                tag = item.get("content_tag", item.get("tag", "unknown_tag"))
+                return "content_tag", tag
+
+    except Exception as e:
+        logger.error(f"❌ Error occurred while reading tag information: {str(e)}")
+        return "", ""
+
+def download_file(access_token, drive_id, file_path, local_path):
+    """Download file using SharePointClient"""
+    global sp_client
+    if not sp_client:
+        sp_client = SharePointClient()
+        sp_client.access_token = access_token
+        sp_client.drive_id = drive_id
+
+    try:
+        content = sp_client.download_file(file_path)
+        if content:
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+            with open(local_path, 'wb') as f:
+                f.write(content)
+            return True
+        return False
+    except Exception as e:
+        print(f"Error downloading file: {str(e)}")
+        return False
+
+def get_list_item_fields(access_token, drive_id):
+    """Get item field information using SharePointClient"""
+    global sp_client
+    if not sp_client:
+        sp_client = SharePointClient()
+        sp_client.access_token = access_token
+        sp_client.drive_id = drive_id
+
+    return sp_client.get_list_item_fields()
+
+def get_items_recursive(access_token, drive_id):
+    """Recursively get items using SharePointClient"""
+    global sp_client
+    if not sp_client:
+        sp_client = SharePointClient()
+        sp_client.access_token = access_token
+
+        sp_client.drive_id = drive_id
+
+    return sp_client.get_items_recursive()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+def read_and_tag_documents_mt(access_token: str, drive_id: str, max_workers: int = 10, read_json_file:str = "sharepoint_fields.json",
+                            temp_dir: str = "temp", tag_dir: str = "tag_result") -> Dict:
+    """
+    Read file contents and tag them using multi-threading, maintaining directory structure including empty folders.
+    Optimization: 1) Two-stage download strategy 2) File integrity check 3) Hybrid multi/single-thread 4) Zero omission guarantee
+    """
+    import math
+    import time
+    
+    # Initialize directories and thread pool size
+    os.makedirs(temp_dir, exist_ok=True)
+    os.makedirs(tag_dir, exist_ok=True)
+    os.makedirs('target', exist_ok=True)
+    
+    # Pre-initialize worker_count to ensure definition in all code paths
+    worker_count = max_workers
+    
+    # Initialize all_downloaded list at the beginning
+    all_downloaded = []  # 在这里初始化
+    
+    # Path normalization function
+    def normalize_path_consistently(path):
+        """Ensure consistent path separators across OS"""
+        if not path:
+            return ""
+        normalized = path.strip("/\\").replace("\\", "/")
+        return normalized
+    
+    # Statistics
+    stats = {
+        'total_items': 0,
+        'files': 0,
+        'folders': 0,
+        'success': 0,
+        'failed': 0,
+        'downloaded': 0,
+        'downloaded_retry': 0,  # Second stage download count
+        'skipped': 0,
+        'matched': 0,
+        'processed': 0,  # New processing counter
+        'total': 0,      # New total counter
+        'lock': threading.Lock()
+    }
+    lock = threading.Lock()
+    content_tags = []
+    
+    # Initialize SharePointClient
+    global sp_client
+    if not sp_client:
+        sp_client = SharePointClient()
+        sp_client.access_token = access_token
+        sp_client.drive_id = drive_id
+    
+    try:
+        # Step 1: Get/load file list and field info
+        print("\n📥 Getting/loading file list and field info...")
+        
+        json_file_path = f"{tag_dir}/{read_json_file}"
+        # Always get new field info
+        print("📥 Getting new field info...")
+        all_items = st.session_state.source_manager.get_items_with_fields_recursive_mt(drive_id)
+        
+        if not all_items:
+            print("❌ No items retrieved")
+            return stats
+        
+        # Save original field info
+        with open(json_file_path, "w", encoding="utf-8") as f:
+            json.dump(all_items, f, ensure_ascii=False, indent=2)
+        print(f"✅ Field info saved to {json_file_path}")
+        
+        # Extract all file and folder items
+        file_items = []
+        folder_items = []
+        
+        def extract_items(items, file_list, folder_list):
+            for item in items:
+                if item['type'] == 'file':
+                    file_list.append(item)
+                else:  # folder
+                    folder_list.append(item)
+                    if 'children' in item and item['children']:
+                        extract_items(item['children'], file_list, folder_list)
+        
+        extract_items(all_items, file_items, folder_items)
+        
+        with lock:
+            stats['total_items'] = len(file_items) + len(folder_items)
+            stats['files'] = len(file_items)
+            stats['folders'] = len(folder_items)
+        print(f"✅ Identified {len(file_items)} files and {len(folder_items)} folders")
+        
+        # Step 2: Pre-create directory structure
+        print("\n📁 Pre-creating directory structure...")
+        for folder in folder_items:
+            folder_path = os.path.join(temp_dir, normalize_path_consistently(folder['path']))
+            if not os.path.exists(folder_path):
+                os.makedirs(folder_path, exist_ok=True)
+                print(f"📁 Folder created: {folder_path}")
+        
+        # Step 3: Scan local files, check against sharepoint_fields.json
+        print("\n🔍 Scanning local files and comparing against SharePoint field info...")
+        
+        # Create all normalized paths for files to download (from sharepoint_fields.json)
+        all_sharepoint_files = {}  # Format: {normalized path: (file_item, file size)}
+        for file_item in file_items:
+            path = file_item.get("path", "")
+            norm_path = normalize_path_consistently(path)
+            file_size = file_item.get("size", 0)
+            all_sharepoint_files[norm_path] = (file_item, file_size)
+        
+        # Scan temp directory, collect information about downloaded files
+        existing_files = {}  # Format: {normalized path: file size}
+        for root, dirs, files in os.walk(temp_dir):
+            for file in files:
+                local_path = os.path.join(root, file)
+                rel_path = os.path.relpath(local_path, temp_dir)
+                norm_path = normalize_path_consistently(rel_path)
+                
+                # Record file size for integrity check
+                try:
+                    file_size = os.path.getsize(local_path)
+                    existing_files[norm_path] = file_size
+                except Exception as e:
+                    print(f"⚠️ Failed to get file size: {local_path} - {str(e)}")
+                    # File might be problematic, do not add to existing file list
+        
+        print(f"✅ Scan complete: {len(all_sharepoint_files)} SharePoint files, {len(existing_files)} local files exist")
+        
+        # Classify files by comparison: need to download, need to update, already up-to-date
+        files_to_download = []  # Files to download
+        files_to_update = []    # Files to update (size mismatch)
+        skipped_files = []      # Files to skip (already exist and size matches)
+        
+        for norm_path, (file_item, remote_size) in all_sharepoint_files.items():
+            if norm_path not in existing_files:
+                # Not present locally, need to download
+                files_to_download.append(file_item)
+            elif existing_files[norm_path] != remote_size and remote_size > 0:
+                # Exists locally but size mismatch, need to update
+                files_to_update.append(file_item)
+                print(f"⚠️ File size mismatch, will re-download: {file_item.get('path', '')}")
+            else:
+                # Exists locally and size matches, skip
+                skipped_files.append(file_item)
+        
+        # Merge files to download and update
+        all_download_files = files_to_download + files_to_update
+        
+        # Update statistics
+        with lock:
+            stats['skipped'] = len(skipped_files)
+        
+        print(f"📥 Need to download {len(files_to_download)} new files, update {len(files_to_update)} files, skip {len(skipped_files)} complete files")
+        
+        # ==== Phase 1: Multithreaded fast download ====
+        if all_download_files:
+            print("\n📦 Phase 1: Multithreaded fast download...")
+            
+            # Dynamically adjust thread pool size
+            dynamic_workers = min(32, max(8, math.ceil(len(all_download_files) / 5)))
+            worker_count = max(dynamic_workers, max_workers)
+            print(f"🚀 Using {worker_count} worker threads for parallel download")
+            
+            # Batch download function
+            def download_file_batch(file_batch):
+                downloaded_files = []
+                download_failed = []
+                session = requests.Session()
+                adapter = requests.adapters.HTTPAdapter(max_retries=2)
+                session.mount('https://', adapter)
+                
+                for file_item in file_batch:
+                    try:
+                        path = file_item["path"]
+                        normalized_path = normalize_path_consistently(path)
+                        local_path = os.path.join(temp_dir, normalized_path)
+                        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                        
+                        success = False
+                        
+                        # URL
+                        if 'download_url' in file_item:
+                            try:
+                                response = session.get(file_item['download_url'], stream=True, timeout=20)
+                                if response.status_code == 200:
+                                    with open(local_path, 'wb') as f:
+                                        for chunk in response.iter_content(chunk_size=32768):
+                                            f.write(chunk)
+                                    success = True
+                            except:
+                                pass 
+                        
+                        # URL->API
+                        if not success:
+                            try:
+                                content = sp_client.download_file(path)
+                                if content:
+                                    with open(local_path, 'wb') as f:
+                                        f.write(content)
+                                    success = True
+                            except:
+                                pass
+                        
+                        if success:
+                            downloaded_files.append((file_item, local_path))
+                            with lock:
+                                stats['downloaded'] += 1
+                        else:
+                            download_failed.append(file_item)
+                    except:
+                        download_failed.append(file_item)
+                
+                return downloaded_files, download_failed
+            
+            # Batch download
+            batch_size = 100  # 100 files per batch
+            download_batches = [all_download_files[i:i+batch_size] for i in range(0, len(all_download_files), batch_size)]
+            all_failed = []
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = [executor.submit(download_file_batch, batch) for batch in download_batches]
+                
+                for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                    try:
+                        batch_downloaded, batch_failed = future.result()
+                        all_downloaded.extend(batch_downloaded)  
+                        all_failed.extend(batch_failed)
+                        print(f"📥 Downloaded: {stats['downloaded']}/{len(all_download_files)} files")
+                    except Exception as e:
+                        print(f"❌ Batch download failed: {str(e)}")
+            
+            print(f"✅ Phase 1 complete: {stats['downloaded']} files downloaded, {len(all_failed)} files failed")
+            
+            # ==== Phase 2: Single-threaded retry for failed files ====
+            if all_failed:
+                print(f"🔄 Phase 2: Retrying {len(all_failed)} files")
+                
+                # Initialize retry session with robust configuration
+                retry_session = requests.Session()
+                retry_adapter = requests.adapters.HTTPAdapter(
+                    max_retries=5,
+                    pool_connections=1,  # Single connection for sequential downloads
+                    pool_maxsize=1
+                )
+                retry_session.mount('https://', retry_adapter)
+                
+                
+                # Sequential download with verification
+                for file_item in all_failed:
+                    path = file_item.get("path", "")
+                    file_size = file_item.get("size", 0)
+                    local_path = os.path.join(temp_dir, normalize_path_consistently(path))
+                    
+                    print(f"🔄 Retrying download: {path}")
+                    
+                    try:
+                        # Ensure directory exists
+                        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                        
+                        # Try direct URL download first
+                        success = False
+                        if 'download_url' in file_item:
+                            try:
+                                with retry_session.get(file_item['download_url'], stream=True, timeout=30) as response:
+                                    response.raise_for_status()
+                                    total_size = int(response.headers.get('content-length', 0))
+                                    
+                                    with open(local_path, 'wb') as f:
+                                        downloaded_size = 0
+                                        for chunk in response.iter_content(chunk_size=8192):
+                                            if chunk:
+                                                f.write(chunk)
+                                                downloaded_size += len(chunk)
+                                                # Print progress
+                                                if total_size > 0:
+                                                    progress = (downloaded_size / total_size) * 100
+                                                    print(f" Download progress: {progress:.1f}%", end='\r')
+                                    
+                                    # Verify file size after download
+                                    if os.path.getsize(local_path) == file_size:
+                                        success = True
+                                        print(f"✅ Successfully downloaded via URL: {path}")
+                            except Exception as e:
+                                print(f"⚠️ URL download failed: {str(e)}")
+                                if os.path.exists(local_path):
+                                    os.remove(local_path)
+                        
+                        # If URL download failed, try API download
+                        if not success:
+                            try:
+                                content = sp_client.download_file(path)
+                                if content:
+                                    with open(local_path, 'wb') as f:
+                                        f.write(content)
+                                    
+                                    # Verify file size after API download
+                                    if os.path.getsize(local_path) == file_size:
+                                        success = True
+                                        print(f"✅ Successfully downloaded via API: {path}")
+                            except Exception as e:
+                                print(f"⚠️ API download failed: {str(e)}")
+                                if os.path.exists(local_path):
+                                    os.remove(local_path)
+                        
+                        # Update statistics based on download result
+                        if success:
+                            all_downloaded.append((file_item, local_path))
+                            with lock:
+                                stats['downloaded_retry'] += 1
+                        else:
+                            print(f"❌ All download methods failed for: {path}")
+                            if os.path.exists(local_path):
+                                os.remove(local_path)
+                            
+                    except Exception as e:
+                        print(f"❌ Download failed for {path}: {str(e)}")
+                        if os.path.exists(local_path):
+                            os.remove(local_path)
+                        continue
+                    
+                    # Add small delay between downloads
+                    time.sleep(1)
+            
+            # Add skipped files to downloaded list for further processing
+            for file_item in skipped_files:
+                try:
+                    path = file_item["path"]
+                    normalized_path = normalize_path_consistently(path)
+                    local_path = os.path.join(temp_dir, normalized_path)
+                    all_downloaded.append((file_item, local_path))  # 使用append添加跳过的文件
+                except Exception as e:
+                    print(f"⚠️ Error processing skipped file: {str(e)}")
+                    continue
+            
+            # Display final download statistics
+            print(f"\n✅ File download complete:")
+            print(f"   - Phase 1: {stats['downloaded']} files")
+            print(f"   - Phase 2: {stats['downloaded_retry']} files")
+            print(f"   - Skipped: {stats['skipped']} files")
+        
+        # Verify final download results, ensure no files are missed
+        print("\n🔍 Final verification of download results, checking for any missed files...")
+        
+        # Calculate expected normalized path set for downloaded files
+        expected_paths = set()
+        path_to_item = {}  # Mapping from path to file item
+        for file_item in file_items:
+            path = file_item.get("path", "")
+            norm_path = normalize_path_consistently(path)
+            expected_paths.add(norm_path)
+            path_to_item[norm_path] = file_item
+        
+        # Calculate actual normalized path set for downloaded files
+        downloaded_paths = set()
+        for file_item, local_path in all_downloaded:
+            path = file_item.get("path", "")
+            norm_path = normalize_path_consistently(path)
+            downloaded_paths.add(norm_path)
+        
+        # Calculate missing files
+        missing_paths = expected_paths - downloaded_paths
+        
+        if missing_paths:
+            print(f"⚠️ Final discovery of {len(missing_paths)} files not successfully downloaded, marked as processing failure")
+            with lock:
+                stats['failed'] += len(missing_paths)
+            # Record names of missed files for reference
+            for i, missing_path in enumerate(list(missing_paths)[:10]):  # Only show first 10
+                print(f"  - {missing_path}")
+            if len(missing_paths) > 10:
+                print(f"  - ... {len(missing_paths) - 10} more not shown")
+        else:
+            print("✅ Verification complete, all files successfully processed, no missed files")
+        
+        # Step 9: Content extraction
+        print(f"\n🔍 Extracting content from {len(all_downloaded)} files...")
+        
+        # Batch content extraction function
+        def extract_content_batch(file_batch):
+            results = []
+            for file_item, local_path in file_batch:
+                try:
+                    path = file_item["path"]
+                    normalized_path = normalize_path_consistently(path)
+                    file_ext = os.path.splitext(os.path.basename(local_path))[1].lower()
+                    
+               
+                    extractors = {
+                        ".docx": extract_text_from_docx,
+                        ".xlsx": extract_text_from_xlsx,
+                        ".pptx": extract_text_from_pptx,
+                        ".dxf": extract_text_from_dxf,
+                        ".zip": extract_text_from_zip
+                    }
+                    
+                    content_tag = extractors.get(file_ext, lambda x: file_ext)(local_path) if file_ext in extractors else file_ext
+                    
+                    results.append({
+                        "name": path,
+                        "normalized_path": normalized_path,
+                        "type": "file",
+                        "content_tag": content_tag
+                    })
+                except Exception as e:
+                    results.append({
+                        "name": path,
+                        "normalized_path": normalized_path,
+                        "type": "file",
+                        "content_tag": ""
+                    })
+            return results
+        
+        # Batch process content extraction
+        batch_size = 100
+        extract_batches = [all_downloaded[i:i+batch_size] for i in range(0, len(all_downloaded), batch_size)]
+        
+        # Re-evaluate worker_count before content extraction
+        if len(extract_batches) > 0:
+            dynamic_workers = min(32, max(8, math.ceil(len(extract_batches) / 5)))
+            worker_count = max(dynamic_workers, max_workers)
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(extract_content_batch, batch) for batch in extract_batches]
+            
+            for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                try:
+                    batch_result = future.result()
+                    content_tags.extend(batch_result)
+                    stats['success'] += len(batch_result)
+                    progress = ((i + 1) / len(extract_batches)) * 100
+                    print(f"🔍 Processed batch {i+1}/{len(extract_batches)} ({progress:.1f}%)")
+                except Exception as e:
+                    print(f"❌ Failed to extract content: {str(e)}")
+                    stats['failed'] += batch_size
+        
+        # Save content tag results
+        with open(f"{tag_dir}/content_tags.json", "w", encoding="utf-8") as f:
+            json.dump(content_tags, f, ensure_ascii=False, indent=2)
+        print(f"✅ Content tags saved to {tag_dir}/content_tags.json")
+        
+        # Step 7: Merge results
+        print("\n🔄 Merging field and content tags...")
+        
+        # Build content tag dictionary
+        content_tags_dict = {}
+        for content_item in content_tags:
+            content_tags_dict[content_item["normalized_path"]] = content_item
+            if "/" in content_item["normalized_path"]:
+                filename = content_item["normalized_path"].split("/")[-1]
+                if filename not in content_tags_dict:
+                    content_tags_dict[filename] = content_item
+        
+        # Flatten all items
+        all_items_flat = []
+        def flatten_items(items):
+            for item in items:
+                all_items_flat.append(item)
+                if 'children' in item and item['children']:
+                    flatten_items(item['children'])
+        flatten_items(all_items)
+        
+        # Merge results
+        merged_data = []
+        for field_item in all_items_flat:
+            merged_item = field_item.copy()
+            normalized_field_path = normalize_path_consistently(field_item["path"])
+            
+            if field_item["type"] == "folder":
+                merged_data.append(merged_item)
+                continue
+                
+            if normalized_field_path in content_tags_dict:
+                merged_item["content_tag"] = content_tags_dict[normalized_field_path]["content_tag"]
+                with lock:
+                    stats['matched'] += 1
+            else:
+                if "/" in normalized_field_path:
+                    filename = normalized_field_path.split("/")[-1]
+                    if filename in content_tags_dict:
+                        merged_item["content_tag"] = content_tags_dict[filename]["content_tag"]
+                        with lock:
+                            stats['matched'] += 1
+                    else:
+                        found_match = False
+                        for content_path, content_item in content_tags_dict.items():
+                            if (normalized_field_path in content_path or content_path in normalized_field_path) and len(content_path) > 3:
+                                merged_item["content_tag"] = content_item["content_tag"]
+                                with lock:
+                                    stats['matched'] += 1
+                                found_match = True
+                                break
+                        if not found_match:
+                            merged_item["content_tag"] = "📄 " + (field_item["name"].split("/")[-1] if "/" in field_item["name"] else field_item["name"])
+                else:
+                    merged_item["content_tag"] = "📄 " + field_item["name"]
+            merged_data.append(merged_item)
+        
+        # Save merged results
+        with open(f"{tag_dir}/merged_sharepoint_data.json", "w", encoding="utf-8") as f:
+            json.dump(merged_data, f, ensure_ascii=False, indent=2)
+        print(f"✅ Merged results saved to {tag_dir}/merged_sharepoint_data.json")
+        
+        # Output final statistics
+        print("\n📊 Processing statistics:")
+        print(f"Total items: {stats['total_items']}")
+        print(f"Files: {stats['files']}")
+        print(f"Folders: {stats['folders']}")
+        print(f"Successfully processed: {stats['success']}")
+        print(f"Processing errors: {stats['failed']}")
+        print(f"Files downloaded (Phase 1): {stats['downloaded']}")
+        print(f"Files downloaded (Phase 2): {stats['downloaded_retry']}")
+        print(f"Skipped: {stats['skipped']}")
+        print(f"Tag matches: {stats['matched']}")
+        
+        print(f"\n✅ Done! Results saved to {tag_dir} directory")
+        print(f"✅ Files downloaded to {temp_dir} directory")
+        
+        return stats
+        
+    except Exception as e:
+        print(f"❌ Error occurred during processing: {str(e)}")
+        logger.error(f"Processing error: {str(e)}", exc_info=True)
+        return stats
+
+
+
+
+class SharePointManager(SharePointClient):
+    """SharePoint Manager, inherits from SharePointClient"""
+
+    def __init__(self, client_id, client_secret, tenant_id, site_name, tenant_name):
+        """
+        Initialize SharePoint Manager
+        Args:
+            client_id (str): Azure AD application Client ID
+            client_secret (str): Azure AD application Client Secret
+            tenant_id (str): Azure AD tenant ID
+            site_name (str): SharePoint site name
+            tenant_name (str): SharePoint tenant name (e.g. "contoso" from contoso.sharepoint.com)
+        """
+        super().__init__(client_id=client_id, client_secret=client_secret,
+                         tenant_id=tenant_id, site_name=site_name, tenant_name=tenant_name)
+
+    def get_items_with_fields_recursive_mt(self, drive_id, current_path="", item_id=None, max_workers=10):
+        """
+        Recursively get all folder and file information with optimized performance.
+        Args:
+            drive_id (str): Drive ID
+            current_path (str): Current path
+            item_id (str): Item ID (for recursion)
+            max_workers (int): Maximum worker threads
+        Returns:
+            list: List containing all item information
+        """
+        import time
+        try:
+            print(f"🔍 Start fetching SharePoint items...")
+            
+            # Core data structures
+            results_dict = {}
+            parent_child_map = {}
+            item_queue = queue.Queue()
+            failed_nodes = []
+            
+            # Thread-safe locks 
+            results_lock = threading.Lock()
+            parent_child_lock = threading.Lock()
+            
+            # Statistics counter with thread-safe lock
+            stats = {
+                'folders': 0, 
+                'files': 0, 
+                'errors': 0,
+                'retry_success': 0,
+                'processed': 0,  # New processing counter
+                'total': 0,      # New total counter
+                'lock': threading.Lock()
+            }
+            
+            # Queue initial root item
+            item_queue.put({
+                'id': item_id,
+                'path': current_path,
+                'is_root': True
+            })
+
+            # Process a single item from the queue
+            def process_item(queue_item):
+                try:
+                    headers = {"Authorization": f"Bearer {self.access_token}"}
+                    current_id = queue_item['id']
+                    current_path = queue_item['path']
+                    is_root = queue_item.get('is_root', False)
+                    
+                    # Build API URL based on current item
+                    url = f"{self.base_url}/drives/{drive_id}/root/children" if not current_id else f"{self.base_url}/drives/{drive_id}/items/{current_id}/children"
+                    
+                    # Get children items
+                    response = requests.get(url, headers=headers)
+                    if response.status_code != 200:
+                        with stats['lock']:
+                            stats['errors'] += 1
+                        failed_nodes.append(queue_item)
+                        return []
+
+                    items = response.json().get('value', [])
+                    items_info = []
+                    
+                    # Update total count when new items are found
+                    with stats['lock']:
+                        stats['total'] += len(items)
+                    
+                    # Pre-configure field request headers
+                    field_headers = {"Authorization": f"Bearer {self.access_token}"}
+                    
+                    # Process each item
+                    for item in items:
+                        item_id = item.get('id')
+                        name = item.get('name')
+                        new_path = f"{current_path}/{name}" if current_path else name
+                        
+                        # Create basic item info
+                        item_info = {
+                            'id': item_id,
+                            'name': name,
+                            'path': new_path,
+                            'web_url': item.get('webUrl'),
+                            'created_time': item.get('createdDateTime'),
+                            'modified_time': item.get('lastModifiedDateTime'),
+                            'size': item.get('size', 0)
+                        }
+                        
+                        # Fetch additional fields in one batch request
+                        fields_url = f"{self.base_url}/drives/{drive_id}/items/{item_id}/listItem/fields"
+                        fields_response = requests.get(fields_url, headers=field_headers)
+                        if fields_response.status_code == 200:
+                            fields = fields_response.json()
+                            # Add non-system fields to item info
+                            item_info.update({
+                                k: v for k, v in fields.items() 
+                                if k not in ['id', 'FileLeafRef'] and not k.startswith('_')
+                            })
+                        
+                        # Process folder or file type
+                        if 'folder' in item:
+                            item_info.update({
+                                'type': 'folder',
+                                'child_count': item.get('folder', {}).get('childCount', 0),
+                                'children': []
+                            })
+                            # Queue folder for processing its children
+                            item_queue.put({
+                                'id': item_id,
+                                'path': new_path,
+                                'is_root': False
+                            })
+                            with stats['lock']:
+                                stats['folders'] += 1
+                        elif 'file' in item:
+                            item_info.update({
+                                'type': 'file',
+                                'file_type': item.get('file', {}).get('mimeType'),
+                                'hash': item.get('file', {}).get('hashes', {}).get('quickXorHash'),
+                                'download_url': item.get('@microsoft.graph.downloadUrl')
+                            })
+                            with stats['lock']:
+                                stats['files'] += 1
+                        
+                        # Store item in results dictionary
+                        with results_lock:
+                            results_dict[item_id] = item_info
+                        
+                        # Build parent-child relationship
+                        if not is_root:
+                            with parent_child_lock:
+                                parent_child_map.setdefault(current_id, []).append(item_id)
+                        
+                        items_info.append(item_info)
+                        
+                        # Update processed count
+                        with stats['lock']:
+                            stats['processed'] += 1
+                    
+                    return items_info
+                except Exception as e:
+                    with stats['lock']:
+                        stats['errors'] += 1
+                    failed_nodes.append(queue_item)
+                    return []
+
+            # Phase 1: Multi-threaded processing
+            print("🚀 Phase 1: Parallel processing...")
+            
+            # Use ThreadPoolExecutor for concurrent processing
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = set()  # 使用 set 而不是 list
+                
+                # Start with root item
+                futures.add(executor.submit(process_item, {'id': item_id, 'path': current_path, 'is_root': True}))
+                
+                # Process items until queue is empty and all futures completed
+                while futures or not item_queue.empty():
+                    # Wait for any future to complete
+                    done, pending = concurrent.futures.wait(
+                        futures, 
+                        timeout=0.1,
+                        return_when=concurrent.futures.FIRST_COMPLETED
+                    )
+                    
+                    # Update futures set
+                    futures = pending
+                    
+                    # Track processed items
+                    if stats['total'] > 0:  # 確保總數不為零
+                        progress = min(1.0, stats['processed'] / stats['total'])
+                        if stats['processed'] % 20 == 0:  # 每處理20個項目更新一次進度
+                            print(f"✅ Progress: {progress:.1%} ({stats['processed']}/{stats['total']})")
+                    
+                    # Add new tasks from queue
+                    while not item_queue.empty() and len(futures) < max_workers:
+                        futures.add(executor.submit(process_item, item_queue.get()))
+
+            # Phase 2: Retry failed items with backoff
+            if failed_nodes:
+                print(f"🔄 Phase 2: Retrying {len(failed_nodes)} failed items...")
+                still_failed = []
+                
+                for i, node in enumerate(failed_nodes):
+                    try:
+                        # Exponential backoff
+                        backoff = min(1.5 * (i % 3 + 1), 3)
+                        time.sleep(backoff)
+                        
+                        # Retry processing
+                        result = process_item(node)
+                        if result:
+                            with stats['lock']:
+                                stats['retry_success'] += 1
+                        else:
+                            still_failed.append(node)
+                    except Exception:
+                        still_failed.append(node)
+                
+                print(f"✅ Retry results: {stats['retry_success']} succeeded, {len(still_failed)} still failed")
+
+            # Build hierarchy
+            print("🔄 Building item hierarchy...")
+            
+            # Find top-level items (not children of any item)
+            all_child_ids = set()
+            for children in parent_child_map.values():
+                all_child_ids.update(children)
+            
+            top_level_items = [
+                item_info for item_id, item_info in results_dict.items() 
+                if item_id not in all_child_ids
+            ]
+            
+            # Recursive function to build hierarchy
+            def build_hierarchy(items):
+                for item in items:
+                    if item['type'] == 'folder':
+                        item_id = item['id']
+                        if item_id in parent_child_map:
+                            children = [results_dict[child_id] for child_id in parent_child_map[item_id] 
+                                       if child_id in results_dict]
+                            item['children'] = children
+                            build_hierarchy(children)
+                return items
+            
+            # Generate final hierarchy
+            final_result = build_hierarchy(top_level_items)
+            
+            # Display final statistics
+            total_items = len(results_dict)
+            print(f"✅ Completed! {total_items} total items: {stats['folders']} folders, {stats['files']} files")
+            
+            return final_result
+        
+        except Exception as e:
+            print(f"❌ Error fetching items: {str(e)}")
+            return []
+
+
+# Streamlit UI
+st.set_page_config(page_title="SharePoint File Transfer", layout="wide")
+st.markdown("<h2 style='color: #333;'>SharePoint File Transfer</h2>", unsafe_allow_html=True)
+
+# Initialize session state
+if 'source_manager' not in st.session_state:
+    st.session_state.source_manager = None
+if 'dest_manager' not in st.session_state:
+    st.session_state.dest_manager = None
+
+# Two-column input layout
+col1, col2 = st.columns([2, 2])
+
+# Load default values
+try:
+    with open('parameters.json', 'r') as f:
+        source_params = json.load(f)
+except:
+    source_params = {}
+
+try:
+    with open('output_parameters.json', 'r') as f:
+        dest_params = json.load(f)
+except:
+    dest_params = {}
+
+with col1:
+    st.subheader("Source URL")
+    source_url = st.text_input(
+        "Source URL",
+        value=f"https://{source_params.get('tenant', 'sdabicorp')}.sharepoint.com",
+        help="https://tenant.sharepoint.com tenant",
+        key="source_url"
+    )
+    source_client_id = st.text_input(
+        "Source Client ID",
+        value=source_params.get('client_id', 'fe75973a-5fbf-40bd-a7e5-3a14b46c4744'),
+        help="Client ID of the application",
+        key="source_client_id"
+    )
+    source_client_secret = st.text_input(
+        "Source Client Secret",
+        value=source_params.get('secret', 'Vyj8Q~7ZlcxquDlwJIdRPam~Vemg-_KjANtQ9b.5'),
+        type="password",
+        help="Client Secret of the application",
+        key="source_client_secret"
+    )
+    source_tenant_id = st.text_input(
+        "Source Tenant ID",
+        value=source_params.get('tenant_id', 'b7d09c10-00fe-43b5-a830-eb5571816fab'),
+        help="Tenant ID of Azure Active Directory",
+        key="source_tenant_id"
+    )
+    source_site_name = st.text_input(
+        "Source Site Name",
+        value=source_params.get('site_name', 'test'),
+        help="SharePoint site name",
+        key="source_site_name"
+    )
+
+with col2:
+    st.subheader("Destination")
+    dest_url = st.text_input(
+        "Destination URL",
+        value=f"https://{dest_params.get('tenant', 'jcardcorp')}.sharepoint.com",
+        help="Please enter the destination SharePoint URL",
+        key="dest_url"
+    )
+    dest_client_id = st.text_input(
+        "Destination Client ID",
+        value=dest_params.get('client_id', '67c1ea63-a3df-40fb-b75d-509ba93f1378'),
+        help="Client ID of the application",
+        key="dest_client_id"
+    )
+    dest_client_secret = st.text_input(
+        "Destination Client Secret",
+        value=dest_params.get('secret', 'g948Q~KPldCRrWsBnvfZrBKFGMpv8.awayfe7bIE'),
+        type="password",
+        help="Client Secret of the application",
+        key="dest_client_secret"
+    )
+    dest_tenant_id = st.text_input(
+        "Destination Tenant ID",
+        value=dest_params.get('tenant_id', '16c61e00-bb32-451c-9d79-b3b0dc95bb17'),
+        help="Tenant ID of Azure Active Directory",
+        key="dest_tenant_id"
+    )
+    dest_site_name = st.text_input(
+        "Destination Site Name",
+        value=dest_params.get('site_name', 'test1'),
+        help="SharePoint site name",
+        key="dest_site_name"
+    )
+
+st.markdown("---")
+st.subheader("Operations")
+
+# Initialize SharePoint managers when credentials are provided
+if all([source_client_id, source_client_secret, source_tenant_id, source_site_name]):
+    # Extract tenant name from URL
+    source_tenant_name = source_url.split('//')[1].split('.sharepoint.com')[0]
+    st.session_state.source_manager = SharePointManager(
+        client_id=source_client_id,
+        client_secret=source_client_secret,
+        tenant_id=source_tenant_id,
+        site_name=source_site_name,
+        tenant_name=source_tenant_name
+    )
+
+if all([dest_client_id, dest_client_secret, dest_tenant_id, dest_site_name]):
+    # Extract tenant name from URL
+    dest_tenant_name = dest_url.split('//')[1].split('.sharepoint.com')[0]
+    st.session_state.dest_manager = SharePointManager(
+        client_id=dest_client_id,
+        client_secret=dest_client_secret,
+        tenant_id=dest_tenant_id,
+        site_name=dest_site_name,
+        tenant_name=dest_tenant_name
+    )
+
+# Button section
+col3, col4 = st.columns(2)
+with col3:
+    if st.button("1. Get file info and tag content", use_container_width=True):
+        # Initialize SharePoint manager
+        if not st.session_state.source_manager:
+            source_tenant_name = source_url.split('//')[1].split('.sharepoint.com')[0]
+            st.session_state.source_manager = SharePointManager(
+                client_id=source_client_id,
+                client_secret=source_client_secret,
+                tenant_id=source_tenant_id,
+                site_name=source_site_name,
+                tenant_name=source_tenant_name
+            )
+
+        if not st.session_state.source_manager:
+            st.error("Please complete all source authentication information first")
+            st.stop()
+
+        # Get access token
+        access_token = st.session_state.source_manager.get_access_token()
+        if not access_token:
+            st.error("Failed to get access token")
+            st.stop()
+        
+        # Get drive_id
+        drive_id = st.session_state.source_manager.get_drive_id()
+        if not drive_id:
+            st.error("Failed to get drive ID")
+            st.stop()
+
+        with st.spinner("Retrieving file information..."):
+            try:
+                # Step 1: Get file information
+                st.info("Step 1/2: Getting file information...")
+                
+                # Create progress indicator
+                progress_placeholder = st.empty()
+                status_text = st.empty()
+                
+                # Directly call processing function
+                stats = read_and_tag_documents_mt(
+                    access_token=access_token, 
+                    drive_id=drive_id, 
+                    max_workers=10,
+                    read_json_file="sharepoint_fields.json"
+                )
+                
+                # Show processing result
+                st.success("✅ File processing completed!")
+                
+                # Show statistics
+                st.write("### Processing Statistics")
+                st.write(f"Total items: {stats['total_items']}")
+                st.write(f"Files: {stats['files']}")
+                st.write(f"Folders: {stats['folders']}")
+                st.write(f"Successfully processed: {stats['success']}")
+                st.write(f"Files downloaded: {stats['downloaded']}")
+                st.write(f"Files skipped (already exist): {stats.get('skipped', 0)}")
+                st.write(f"Processing errors: {stats['failed']}")
+                
+                # If processing is successful, show result file link
+                if os.path.exists('tag_result/merged_sharepoint_data.json'):
+                    st.info("Results saved to tag_result/merged_sharepoint_data.json")
+                
+            except Exception as e:
+                st.error(f"Error occurred during processing: {str(e)}")
+                logger.error(f"Processing error: {str(e)}", exc_info=True)
+
+    if st.button("2. Auto classify documents", use_container_width=True):
+        if not st.session_state.source_manager:
+            st.error("Please complete all source authentication information first")
+            st.stop()
+
+        if st.session_state.source_manager.get_access_token():
+            with st.spinner("Classifying files..."):
+                try:
+                    # Check necessary files exist
+                    if not os.path.exists('tag_result/merged_sharepoint_data.json'):
+                        st.error("Please run 'Read and tag file content' first")
+                        st.stop()
+
+                    if not os.path.exists('config/classification_rules.json'):
+                        st.error("Classification rules file not found")
+                        st.stop()
+
+                    # Initialize classifier
+                    classifier = AutoDocumentClassifier(
+                        rules_file='config/classification_rules.json',
+                        merged_data_file='tag_result/merged_sharepoint_data.json'
+                    )
+
+                    # Ensure directory exists
+                    os.makedirs('temp', exist_ok=True)
+                    os.makedirs('target', exist_ok=True)
+
+                    # Execute classification - change process_files to auto_classify
+                    stats = classifier.auto_classify('temp', 'target')
+
+                    # Display classification results
+                    st.success("✅ File classification completed!")
+
+                    # Display statistics
+                    st.write("Classification statistics:")
+                    st.write(f"- Total files: {stats['total']}")
+                    st.write(f"- Successfully processed: {stats['success']}")
+                    st.write(f"- Failed to process: {stats['failed']}")
+                    st.write(f"- Missing files: {stats['missing']}")
+
+                    st.write("\nCategory statistics:")
+                    for category, count in stats['categories'].items():
+                        st.write(f"- {category or 'Unclassified'}: {count} files")
+
+                    # If there are missing files, display list
+                    if stats.get('missing_files'):
+                        st.write("\nMissing files list:")
+                        for file_path in stats['missing_files']:
+                            st.write(f"- {file_path}")
+
+                except Exception as e:
+                    st.error(f"Error occurred during file classification: {str(e)}")
+                    st.exception(e)
+        else:
+            st.error("Failed to get access token, please check authentication information")
+
+    def upload_target_to_sharepoint(resume_upload=False, log_file=None):
+        """Upload the target folder structure and files to SharePoint, support breakpoint resume with log_file"""
+        try:
+            if not st.session_state.dest_manager or not st.session_state.dest_manager.get_access_token():
+                st.error("Please complete all target authentication information first")
+                return False
+
+            # Check target directory exists
+            if not os.path.exists('target'):
+                st.error("Target directory not found, please run classification first")
+                return False
+
+            with st.spinner("📤 Uploading files to SharePoint..."):
+                # Get drive ID
+                drive_id = st.session_state.dest_manager.get_drive_id()
+                if not drive_id:
+                    st.error("Failed to get target drive ID")
+                    return False
+
+                access_token = st.session_state.dest_manager.access_token
+
+                # Initialize upload logger, including site name
+                site_name = st.session_state.dest_manager.site_name
+                upload_logger = SharePointUploadLogger(site_name=site_name)
+
+                # Step 1: Ensure all necessary fields exist (maintain original logic)
+                try:
+                    # Get site ID
+                    site_url = f"https://graph.microsoft.com/v1.0/sites/{st.session_state.dest_manager.tenant_name}.sharepoint.com:/sites/{st.session_state.dest_manager.site_name}"
+                    site_res = requests.get(site_url, headers={"Authorization": f"Bearer {access_token}"})
+                    if site_res.status_code != 200:
+                        st.error(f"Failed to get site information: {site_res.text}")
+                        return False
+
+                    site_id = site_res.json()["id"]
+
+                    # Get document library ID
+                    list_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists"
+                    list_res = requests.get(list_url, headers={"Authorization": f"Bearer {access_token}"})
+                    if list_res.status_code != 200:
+                        st.error(f"Failed to get document library list: {list_res.text}")
+                        return False
+
+                    # Find document library
+                    doc_lib = next((l for l in list_res.json()["value"] if l["name"] == "Documents" or l["name"] == "Shared Documents"), None)
+                    if not doc_lib:
+                        st.error("Document library not found")
+                        return False
+
+                    list_id = doc_lib["id"]
+
+                    # Extract all possible tags from merged_sharepoint_data.json
+                    all_fields = {}
+                    if os.path.exists('tag_result/merged_sharepoint_data.json'):
+                        try:
+                            with open('tag_result/merged_sharepoint_data.json', 'r', encoding='utf-8') as f:
+                                merged_data = json.load(f)
+
+                            # Collect all fields from all files
+                            for item in merged_data:
+                                if item.get('type') == 'file':
+                                    try:
+                                        # Extract other useful fields - use safe method to get index
+                                        keys = list(item.keys())
+
+                                        # Safe get index, if not found use default value
+                                        start_index = keys.index('@odata.etag') if '@odata.etag' in keys else 0
+                                        end_index = keys.index('ContentType') if 'ContentType' in keys else len(keys)
+
+                                        # Get key-value pairs in specified range
+                                        filter_data = {key: item[key] for key in keys[start_index+1:end_index]}
+                                        try:
+                                             filter_data['content_tag'] = item.get('content_tag', '')
+                                        except:
+                                            pass
+                                        # Ensure filter_list is defined
+                                        filter_list = getattr(globals(), 'filter_list', [])
+                                        for key, value in filter_data.items():
+                                            if key not in filter_list and value:
+                                                all_fields[key] = value
+                                    except Exception as e:
+                                        logger.error(f"❌ Error processing item fields: {str(e)}")
+                                        continue
+                        except Exception as e:
+                            logger.error(f"❌ Error reading/processing merged_sharepoint_data.json: {str(e)}")
+
+                    column_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/columns"
+                    # Fields to create
+                    fields_to_create = [field for field in all_fields.keys() if field and field.strip()]  # Ensure field names are not empty
+
+                    if fields_to_create:
+                        logger.info(f"Need to create {len(fields_to_create)} new fields")
+
+                        # Batch create fields
+                        created_count = 0
+                        failed_count = 0
+
+                        for field_name in fields_to_create:
+                            try:
+                                # Ensure field name is not empty
+                                if not field_name or not field_name.strip():
+                                    logger.warning("⚠️ Skip empty field name")
+                                    continue
+
+                                display_name = field_name
+
+                                create_payload = {
+                                    "name": field_name,
+                                    "displayName": display_name,
+                                    "text": {}
+                                }
+
+                                # Record full request content for debugging
+                                logger.info(f"Creating new field: {field_name}, Request content: {json.dumps(create_payload)}")
+
+                                # Use explicit JSON serialization
+                                create_res = requests.post(
+                                    column_url,
+                                    headers={
+                                        "Authorization": f"Bearer {access_token}",
+                                        "Content-Type": "application/json"
+                                    },
+                                    json=create_payload
+                                )
+
+                                if create_res.status_code == 201:
+                                    logger.info(f"✅ Field {field_name} created successfully!")
+                                    created_count += 1
+                                else:
+                                    logger.warning(f"⚠️ Field {field_name} creation failed: {create_res.status_code} - {create_res.text}")
+                                    failed_count += 1
+                            except Exception as e:
+                                logger.error(f"❌ Error creating field {field_name}: {str(e)}")
+                                failed_count += 1
+
+                        logger.info(f"Field creation result: Success {created_count}, Failed {failed_count}")
+
+                        # If new fields were created, wait for SharePoint to process
+                        if created_count > 0:
+                            wait_time = min(5 + created_count, 10)  # Adjust wait time based on number of fields, up to 20 seconds
+                            with st.spinner(f"Waiting for SharePoint to process new fields ({wait_time} seconds)..."):
+                                time.sleep(wait_time)
+                    else:
+                        logger.info("All necessary fields already exist, no need to create")
+
+                except Exception as e:
+                    logger.error(f"Error checking and creating fields: {str(e)}")
+                    # Continue execution, do not interrupt upload process
+
+                # Step 2: Optimized version of uploading files and writing tags
+                # Preload tag data to avoid repeated reading
+                tag_cache = {}
+                if os.path.exists('tag_result/merged_sharepoint_data.json'):
+                    try:
+                        with open('tag_result/merged_sharepoint_data.json', 'r', encoding='utf-8') as f:
+                            merged_data = json.load(f)
+                        logger.info(f"✅ Tag data loaded, {len(merged_data)} records")
+
+                        # Create efficient lookup dictionary
+                        for item in merged_data:
+                            item_path = item.get("path", "").replace('\\', '/').strip('/')
+                            if item_path:
+                                tag_cache[item_path] = item.get("content_tag", "")
+                            # Also add filename as fallback match
+                            name = item.get("name", "")
+                            if name and name not in tag_cache:
+                                tag_cache[name] = item.get("content_tag", "")
+                            # Add normalized_path
+                            norm_path = item.get("normalized_path", "")
+                            if norm_path and norm_path not in tag_cache:
+                                tag_cache[norm_path] = item.get("content_tag", "")
+                    except Exception as e:
+                        logger.error(f"❌ Tag data loading failed: {str(e)}")
+
+                # Collect all files to upload
+                all_files = []
+                created_folders = set()  # Used to track created folders
+
+                # Recursively collect all files
+                for root, dirs, files in os.walk('target'):
+                    # Calculate relative path
+                    rel_path = os.path.relpath(root, 'target') if root != 'target' else ""
+                    sp_folder_path = rel_path.replace('\\', '/')
+
+                    # Add folder path (for creation)
+                    if rel_path and rel_path != '.':
+                        created_folders.add(sp_folder_path)
+
+                    # Add files
+                    for file in files:
+                        local_path = os.path.join(root, file)
+                        sp_file_path = os.path.join(sp_folder_path, file).replace('\\', '/')
+                        all_files.append((local_path, sp_file_path))
+
+                # Handle resume upload
+                if resume_upload and log_file:
+                    try:
+                        # Load specified log file
+                        if upload_logger.load_log(log_file):
+                            # Get successfully uploaded files
+                            successfully_uploaded = upload_logger.get_successful_files()
+
+                            # Update statistics
+                            files_uploaded = len(successfully_uploaded)
+
+                            # Display resume information
+                            st.info(f"Resuming upload task, {files_uploaded} files uploaded, remaining {len(all_files) - files_uploaded} files")
+
+                            # Filter out already uploaded files
+                            all_files = upload_logger.filter_files_to_upload(all_files)
+                        else:
+                            st.warning("Unable to load specified log file, will create new log")
+                            upload_logger.create_log(all_files)
+                    except Exception as e:
+                        st.warning(f"Error processing resume: {str(e)}, will create new log")
+                        upload_logger.create_log(all_files)
+                else:
+                    # Create new log file
+                    upload_logger.create_log(all_files)
+
+                # Define thread-safe counter
+                from threading import Lock
+                counter_lock = Lock()
+
+                # Get log statistics
+                log_stats = upload_logger.get_statistics()
+
+                stats = {
+                    'processed': 0,
+                    'success': 0,
+                    'error': 0,
+                    'total': len(all_files),
+                    'skipped': log_stats['success']
+                }
+
+                # Start periodic log saving
+                upload_logger.start_periodic_save(30)
+
+                # Define function to upload single file (with exponential backoff)
+                def upload_single_file(file_tuple, max_retries=3):
+                    local_path, sp_path = file_tuple
+                    # filename = os.path.basename(local_path)
+
+                    # 1. Ensure the folder exists
+                    folder_path = os.path.dirname(sp_path)
+                    if folder_path and folder_path not in created_folders:
+                        try:
+                            create_folder(folder_path, drive_id, access_token)
+                            created_folders.add(folder_path)
+                        except Exception as e:
+                            logger.error(f"❌ Folder creation failed {folder_path}: {str(e)}")
+                            upload_logger.update_file_status(
+                                local_path,
+                                sp_path,
+                                "error",
+                                error=f"Folder creation failed: {str(e)}"
+                            )
+                            with counter_lock:
+                                stats['processed'] += 1
+                                stats['error'] += 1
+                            return False
+
+                    # 2. File upload logic (separate block, reduce nesting)
+                    file_id = None
+                    error_message = None
+                    for attempt in range(max_retries):
+                        try:
+                            url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{sp_path}:/content"
+                            headers = {
+                                "Authorization": f"Bearer {access_token}",
+                                "Content-Type": "application/octet-stream"
+                            }
+                            timeout = 30 * (attempt + 1)
+                            with open(local_path, "rb") as f:
+                                res = requests.put(url, headers=headers, data=f, timeout=timeout)
+                            if res.status_code in [200, 201, 202]:
+                                file_id = res.json().get('id')
+                                upload_logger.update_file_status(
+                                    local_path,
+                                    sp_path,
+                                    "success",
+                                    file_id=file_id
+                                )
+                                break
+                            if attempt < max_retries - 1:
+                                wait_time = (2 ** attempt) + random.random()
+                                logger.warning(f"⚠️ Upload retry ({attempt+1}/{max_retries}): {res.status_code} - Waiting {wait_time:.1f} seconds")
+                                time.sleep(wait_time)
+                            else:
+                                error_message = f"Upload failed: {res.status_code} - {res.text}"
+                                logger.error(f"❌ {error_message}")
+                                upload_logger.update_file_status(
+                                    local_path,
+                                    sp_path,
+                                    "error",
+                                    error=error_message
+                                )
+                        except Exception as e:
+                            if attempt < max_retries - 1:
+                                wait_time = (2 ** attempt) + random.random()
+                                logger.warning(f"⚠️ Upload error, retry ({attempt+1}/{max_retries}): {str(e)} - Waiting {wait_time:.1f} seconds")
+                                time.sleep(wait_time)
+                            else:
+                                error_message = f"Upload failed: {str(e)}"
+                                logger.error(f"❌ {error_message}")
+                                upload_logger.update_file_status(
+                                    local_path,
+                                    sp_path,
+                                    "error",
+                                    error=error_message
+                                )
+                    # 3. Tag setting logic (separate block, reduce nesting)
+                    if file_id:
+                        try:
+                            rel_file_path = os.path.relpath(local_path, 'target')
+                            normalized_path = rel_file_path.replace('\\', '/').strip('/')
+                            field_value = None
+                            if normalized_path in tag_cache:
+                                field_value = tag_cache[normalized_path]
+                            elif os.path.basename(normalized_path) in tag_cache:
+                                field_value = tag_cache[os.path.basename(normalized_path)]
+                            if not field_value:
+                                field_name, field_value = get_field_info_for_file(rel_file_path)
+                            else:
+                                field_name = "content_tag"
+                            patch_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{file_id}/listItem/fields"
+                            patch_headers = {
+                                "Authorization": f"Bearer {access_token}",
+                                "Content-Type": "application/json"
+                            }
+                            patch_body = {field_name: field_value}
+                            for attempt in range(max_retries):
+                                try:
+                                    patch_res = requests.patch(patch_url, headers=patch_headers, json=patch_body, timeout=30)
+                                    if patch_res.status_code == 200:
+                                        logger.info(f"✅ Tag set successfully: {local_path} -> {field_value}")
+                                        break
+                                    if attempt < max_retries - 1:
+                                        wait_time = (2 ** attempt) + random.random()
+                                        time.sleep(wait_time)
+                                    else:
+                                        logger.error(f"❌ Tag set failed: {patch_res.status_code} - {patch_res.text}")
+                                except Exception as e:
+                                    if attempt < max_retries - 1:
+                                        wait_time = (2 ** attempt) + random.random()
+                                        time.sleep(wait_time)
+                                    else:
+                                        logger.error(f"❌ Tag set failed: {str(e)}")
+                        except Exception as e:
+                            logger.error(f"❌ Error processing tag: {str(e)}")
+
+                    # 4. Unified statistics update
+                    with counter_lock:
+                        stats['processed'] += 1
+                        if file_id:
+                            stats['success'] += 1
+                        else:
+                            stats['error'] += 1
+                    return file_id is not None
+
+                # Define function to create folder
+                def create_folder(folder_path, drive_id, access_token, max_retries=3):
+                    if not folder_path:
+                        return True
+
+                    # Check if already created
+                    if folder_path in created_folders:
+                        return True
+
+                    # Ensure parent folder exists
+                    parent_path = os.path.dirname(folder_path)
+                    if parent_path and parent_path not in created_folders:
+                        create_folder(parent_path, drive_id, access_token)
+                        created_folders.add(parent_path)
+
+                    # Create current folder
+                    encoded_path = folder_path.replace(" ", "%20")
+                    url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{encoded_path}"
+
+                    for attempt in range(max_retries):
+                        try:
+                            # Check folder exists
+                            check_res = requests.get(
+                                url,
+                                headers={"Authorization": f"Bearer {access_token}"},
+                                timeout=30
+                            )
+
+                            if check_res.status_code == 200:
+                                # Folder exists
+                                return True
+
+                            # Create folder
+                            create_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root/children"
+                            create_headers = {
+                                "Authorization": f"Bearer {access_token}",
+                                "Content-Type": "application/json"
+                            }
+                            create_body = {
+                                "name": os.path.basename(folder_path),
+                                "folder": {},
+                                "@microsoft.graph.conflictBehavior": "replace"
+                            }
+
+                            if parent_path:
+                                # If there is parent folder, create in parent folder
+                                encoded_parent = parent_path.replace(" ", "%20")
+                                parent_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{encoded_parent}"
+                                parent_res = requests.get(parent_url, headers={"Authorization": f"Bearer {access_token}"})
+                                if parent_res.status_code == 200:
+                                    parent_id = parent_res.json().get("id")
+                                    create_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{parent_id}/children"
+
+                            create_res = requests.post(
+                                create_url,
+                                headers=create_headers,
+                                json=create_body,
+                                timeout=30
+                            )
+
+                            if create_res.status_code in [200, 201]:
+                                logger.info(f"✅ Folder created successfully: {folder_path}")
+                                return True
+                            elif attempt < max_retries - 1:
+                                # Exponential backoff
+                                wait_time = (2 ** attempt) + random.random()
+                                time.sleep(wait_time)
+                            else:
+                                logger.error(f"❌ Folder creation failed: {create_res.status_code} - {create_res.text}")
+                                return False
+                        except Exception as e:
+                            if attempt < max_retries - 1:
+                                # Exponential backoff
+                                wait_time = (2 ** attempt) + random.random()
+                                time.sleep(wait_time)
+                            else:
+                                logger.error(f"❌ Folder creation error: {str(e)}")
+                                return False
+
+                    return False
+
+                # Display progress
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+
+                # Calculate total file count
+                total_files = len(all_files)
+
+                # Dynamically adjust thread count based on file count
+                max_workers = min(20, max(10, total_files // 5))  # Minimum 10, Maximum 20 threads
+
+                # Use thread pool to concurrently upload all files
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    # Submit all tasks
+                    futures = [executor.submit(upload_single_file, file_tuple) for file_tuple in all_files]
+
+                    # Process completed tasks
+                    for future in concurrent.futures.as_completed(futures):
+                        try:
+                            future.result()  # Get result (exceptions will be raised here)
+                            # Display progress
+                            with counter_lock:
+                                progress = (stats['processed'] / stats['total']) * 100
+                                progress_bar.progress(progress)
+                                # Calculate percentage for display
+                                progress_percentage = (stats['processed'] / stats['total']) * 100
+                                # But use 0-1 value for the progress bar
+                                progress_bar.progress(stats['processed'] / stats['total'])
+                                status_text.text(f"Progress: {progress_percentage:.1f}% ({stats['processed']}/{stats['total']})")
+                        except Exception as e:
+                            logger.error(f"❌ Task execution failed: {str(e)}")
+                            # Progress bar and status text will automatically update
+
+                # Stop periodic log saving
+                upload_logger.stop_periodic_save()
+
+                # Final update and save log file
+                upload_logger.save_log()
+
+                # Clean up progress display
+                progress_bar.empty()
+                status_text.empty()
+
+                # Display final results
+                st.success("✅ File upload completed!")
+                st.write(f"Total processed: {stats['total']} files")
+                st.write(f"Successfully uploaded: {stats['success']} files")
+                st.write(f"Upload errors: {stats['error']} files")
+                if stats['skipped'] > 0:
+                    st.write(f"Skipped (previously uploaded): {stats['skipped']} files")
+
+                # Display log file information
+                st.info(f"Upload log saved to: {upload_logger.log_filename}")
+
+                # If there are failed files, provide retry option
+                if stats['error'] > 0:
+                    st.warning(f"There are {stats['error']} files that failed to upload. You can retry using the 'Resume Upload' feature later.")
+
+                return True
+
+        except Exception as e:
+            st.error(f"Error occurred during upload: {str(e)}")
+            logger.error(f"Upload failed: {str(e)}")
+            return False
+
+    # Add upload option
+    st.subheader("3. Upload files to SharePoint")
+
+    # Add resume upload option (default enabled)
+    resume_upload = st.checkbox("Enable resume upload", value=True, help="If the upload is interrupted, you can resume from where it left off")
+
+    selected_log_file = None
+    if resume_upload:
+        # Get available log files
+        log_files = SharePointUploadLogger.get_available_logs()
+
+        if not log_files:
+            st.warning("No available upload log files found, a new log will be created")
+        else:
+            # Display log file selector
+            log_options = [log["display_name"] for log in log_files]
+            selected_index = st.selectbox("Select the task to resume", range(len(log_options)), format_func=lambda i: log_options[i])
+            selected_log_file = log_files[selected_index]["filename"]
+
+            # Display selected log details
+            st.info(f"Selected: {log_options[selected_index]}")
+
+            # Display detailed information about selected log file
+            with st.expander("View log details"):
+                # Create temporary logger to load log
+                # Extract site name from log filename (if any)
+                site_name = None
+                filename = os.path.basename(selected_log_file)
+                if filename.startswith("upload_log_") and "_20" in filename:
+                    parts = filename.split("_")
+                    if len(parts) > 3:  # Has site name
+                        site_name = parts[2]
+
+                temp_logger = SharePointUploadLogger(site_name=site_name)
+                if temp_logger.load_log(selected_log_file):
+                    # Get statistics
+                    log_stats = temp_logger.get_statistics()
+
+                    # Display statistics
+                    st.write(f"Total files: {log_stats['total']}")
+                    st.write(f"Successfully uploaded: {log_stats['success']}")
+                    st.write(f"Upload errors: {log_stats['error']}")
+                    st.write(f"Pending: {log_stats['pending']}")
+
+                    # Display start time and last update time
+                    start_time = log_stats.get("start_time", "Unknown")
+                    last_update = log_stats.get("last_update", "Unknown")
+
+                    try:
+                        start_dt = datetime.datetime.fromisoformat(start_time)
+                        start_time = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+                    except:
+                        pass
+
+                    try:
+                        last_dt = datetime.datetime.fromisoformat(last_update)
+                        last_update = last_dt.strftime("%Y-%m-%d %H:%M:%S")
+                    except:
+                        pass
+
+                    st.write(f"Start time: {start_time}")
+                    st.write(f"Last update: {last_update}")
+
+    # Add upload button
+    if st.button("Start uploading to SharePoint", use_container_width=True):
+        upload_target_to_sharepoint(resume_upload=resume_upload, log_file=selected_log_file)
+
+    # Add delete button
+    if st.button("4. Delete SharePoint folders/files/tags", use_container_width=True):
+        if not st.session_state.dest_manager:
+            st.error("Please complete all target authentication information first")
+            st.stop()
+
+        access_token = st.session_state.dest_manager.get_access_token()
+        if not access_token:
+            st.error("Failed to get access token")
+            st.stop()
+
+        # Display confirmation dialog
+        shutil.rmtree('temp', ignore_errors=True)
+        shutil.rmtree('target', ignore_errors=True)
+        with st.spinner("Deleting SharePoint content..."):
+            try:
+                # Import SharePointCleaner class
+                from delete_sharepoint_fields import SharePointCleaner
+
+                # Get parameters
+                site_name = st.session_state.dest_manager.site_name
+                tenant_domain = getattr(st.session_state.dest_manager, 'tenant_domain', "jcardcorp.sharepoint.com")
+                target_library_name = getattr(st.session_state.dest_manager, 'target_library_name', "Shared Documents")
+
+                # Create SharePointCleaner instance
+                cleaner = SharePointCleaner(tenant_domain, target_library_name, site_name)
+
+                # Set access token (if already obtained)
+                cleaner.access_token = access_token
+
+                # Execute delete operation
+                result = cleaner.delete_sharepoint_content(delete_fields=True, delete_files=True)
+
+                # Display result
+                if result['success']:
+                    st.success("✅ Delete operation completed successfully")
+
+                    # Display detailed statistics
+                    st.write("📊 Delete statistics:")
+                    st.write(f"- Files and folders: Success {result['items']['success']}, Failed {result['items']['failed']}, Total {result['items']['total']}")
+                    st.write(f"- Tags: Success {result['fields']['success']}, Failed {result['fields']['failed']}, Total {result['fields']['total']}")
+                else:
+                    st.error(f"❌ Delete operation failed: {result['error']}")
+            except Exception as e:
+                st.error(f"❌ Error occurred during delete: {str(e)}")
+                st.exception(e)
+
+
+st.markdown("---")
+

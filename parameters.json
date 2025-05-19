@@ -1,0 +1,10 @@
+{
+  "note": "You configure either the authority setting when you are using Entra ID or External ID, or the oidc_authority setting when you are using External ID with its custom domain. Change the other one to null",
+  "tenant_id": "b7d09c10-00fe-43b5-a830-eb5571816fab",
+  "oidc_authority": null,
+  "client_id": "fe75973a-5fbf-40bd-a7e5-3a14b46c4744",
+  "scope": [ "https://graph.microsoft.com/.default" ],
+  "secret": "Vyj8Q~7ZlcxquDlwJIdRPam~Vemg-_KjANtQ9b.5",
+  "site_name":"test",
+  "tenant":"sdabicorp"
+}
