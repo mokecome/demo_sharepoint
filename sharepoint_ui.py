@@ -1181,6 +1181,38 @@ with col3:
 
     def upload_target_to_sharepoint(resume_upload=False, log_file=None):
         """Upload the target folder structure and files to SharePoint, support breakpoint resume with log_file"""
+        # Define fields to exclude from metadata payload
+        METADATA_EXCLUSION_FIELDS = {
+            # Common SharePoint read-only or system-managed fields
+            'id', 'name', 'path', 'webUrl', 'web_url', 'createdDateTime', 'created_time', 
+            'lastModifiedDateTime', 'modified_time', 'size', 'parentReference', 
+            'contentType', 'ContentTag', '@odata.etag', 'eTag', 'createdBy', 'lastModifiedBy', 
+            'fileSystemInfo', 'folder', 'file', 'package', 'shared', 'sharing', 
+            'specialFolder', 'cTag', 'root', 'remoteItem', 'children', 'activities', 
+            'analytics', 'permissions', 'subscriptions', 'versions', 'thumbnails', 
+            'listItem', 'driveItem', 'searchResult', 'publication', 'bundle',
+            # Fields that might be in source but not directly updatable or relevant for new item
+            'AuthorLookupId', 'EditorLookupId', 'DocIcon', 'LinkFilenameNoMenu', 
+            'LinkFilename', 'ItemChildCount', 'FolderChildCount', 'AppAuthorLookupId', 
+            'AppEditorLookupId', '_ComplianceFlags', '_ComplianceTag', '_ComplianceTagWrittenTime',
+            '_ComplianceTagUserId', '_DisplayName', '_IsCurrentVersion', '_Level', '_ModerationComments',
+            '_ModerationStatus', '_UIVersion', '_UIVersionString', 'odata.context', 
+            'MediaServiceImageTags', 'ParentVersionStringLookupId', 'ParentLeafNameLookupId',
+            'BSN', 'FileDirRef', 'FileLeafRef', 'FileRef', 'FSObjType', 'GUID', 'InstanceID',
+            'MetaInfo', 'Order', 'ScopeId', 'SortBehavior', 'UniqueId', 'WorkflowInstanceID',
+            'WorkflowVersion', 'Modified_x0020_By', 'Created_x0020_By', 'CopySource',
+            'CheckoutUserLookupId', 'IsCheckedoutToLocal', 'LinkTitle', 'PrincipalCount',
+            'MediaServiceFastMetadata', 'MediaServiceGenerationTime',
+            'MediaServiceOCR', 'VirusStatus', '_EditMenuTableEnd', '_EditMenuTableStart',
+            # Fields from the provided fiter_list that should be excluded
+            'type', 'child_count', 'hash', 'download_url', 'FileSizeDisplay',
+            # Fields that are often problematic or managed by SharePoint
+            'ContentTypeId', 'GUID', 'Created', 'Modified', 'Author', 'Editor',
+            'Attachments', 'CheckedOutTitle', 'CheckoutUserId', 'File_x0020_Type',
+            'HTML_x0020_File_x0020_Type', 'TemplateUrl', 'xd_ProgID', 'xd_Signature',
+            # Specific to this application's logic, if any, that should not be set as metadata
+            'normalized_path', # This is used for lookup, not a SP field
+        }
         try:
             if not st.session_state.dest_manager or not st.session_state.dest_manager.get_access_token():
                 st.error("Please complete all target authentication information first")
@@ -1330,28 +1362,37 @@ with col3:
 
                 # Step 2: Optimized version of uploading files and writing tags
                 # Preload tag data to avoid repeated reading
-                tag_cache = {}
-                if os.path.exists('tag_result/merged_sharepoint_data.json'):
+                # Step 1: Identify Tag Data (Loading merged_sharepoint_data.json and populating file_metadata_mapping)
+                file_metadata_mapping: Dict[str, Dict[Any, Any]] = {}
+                merged_data_path = "tag_result/merged_sharepoint_data.json"
+                logger.info(f"Attempting to load tag data from {merged_data_path}")
+                if os.path.exists(merged_data_path):
                     try:
-                        with open('tag_result/merged_sharepoint_data.json', 'r', encoding='utf-8') as f:
+                        with open(merged_data_path, 'r', encoding='utf-8') as f:
                             merged_data = json.load(f)
-                        logger.info(f"✅ Tag data loaded, {len(merged_data)} records")
+                        logger.info(f"✅ Successfully loaded {merged_data_path}, containing {len(merged_data)} items.")
 
-                        # Create efficient lookup dictionary
                         for item in merged_data:
-                            item_path = item.get("path", "").replace('\\', '/').strip('/')
-                            if item_path:
-                                tag_cache[item_path] = item.get("content_tag", "")
-                            # Also add filename as fallback match
-                            name = item.get("name", "")
-                            if name and name not in tag_cache:
-                                tag_cache[name] = item.get("content_tag", "")
-                            # Add normalized_path
-                            norm_path = item.get("normalized_path", "")
-                            if norm_path and norm_path not in tag_cache:
-                                tag_cache[norm_path] = item.get("content_tag", "")
+                            if item.get('type') == 'file':
+                                filename = item.get("name")
+                                if not filename:
+                                    logger.warning(f"⚠️ Item found with no name, skipping: {item}")
+                                    continue
+
+                                if filename in file_metadata_mapping:
+                                    logger.warning(f"⚠️ Duplicate filename found: '{filename}'. Overwriting with new item. Old: {file_metadata_mapping[filename]}, New: {item}")
+                                file_metadata_mapping[filename] = item
+                            # else: # Optionally log skipped non-file items
+                                # logger.debug(f"Skipping non-file item: {item.get('name')}")
+                        
+                        logger.info(f"✅ Populated file_metadata_mapping with {len(file_metadata_mapping)} file entries.")
+
+                    except json.JSONDecodeError as e:
+                        logger.error(f"❌ Error decoding JSON from {merged_data_path}: {str(e)}")
                     except Exception as e:
-                        logger.error(f"❌ Tag data loading failed: {str(e)}")
+                        logger.error(f"❌ An unexpected error occurred while loading or processing {merged_data_path}: {str(e)}")
+                else:
+                    logger.error(f"❌ Tag data file not found: {merged_data_path}. Cannot populate file_metadata_mapping.")
 
                 # Collect all files to upload
                 all_files = []
@@ -1417,115 +1458,375 @@ with col3:
                 # Start periodic log saving
                 upload_logger.start_periodic_save(30)
 
-                # Define function to upload single file (with exponential backoff)
-                def upload_single_file(file_tuple, max_retries=3):
+                # 在upload_target_to_sharepoint函数内，替换upload_single_file函数定义
+                # 添加全局变量用于metadata延迟处理
+                metadata_update_queue = []
+                metadata_queue_lock = threading.Lock()
+                file_upload_locks = {}  # 用于防止同名文件并发上传
+                upload_locks_mutex = threading.Lock()  # 保护file_upload_locks字典的锁
+
+                # Define function to upload single file (with enhanced error handling and delayed metadata)
+                def upload_single_file(file_tuple, file_metadata_map, expected_fields_keys, sp_manager, max_retries=3):
                     local_path, sp_path = file_tuple
+                    file_id = None
                     
-                    # 1. 确保文件夹存在
-                    folder_path = os.path.dirname(sp_path)
-                    if folder_path and folder_path not in created_folders:
+                    # 获取文件名用于并发控制
+                    filename = os.path.basename(sp_path)
+                    
+                    # 实现文件级别的上传锁，防止同名文件并发冲突
+                    with upload_locks_mutex:
+                        if filename not in file_upload_locks:
+                            file_upload_locks[filename] = threading.Lock()
+                        file_lock = file_upload_locks[filename]
+                    
+                    # 使用文件级锁确保同名文件不会并发上传
+                    with file_lock:
                         try:
-                            create_folder(folder_path, drive_id, access_token)
-                            created_folders.add(folder_path)
+                            # 1. 确保文件夹存在
+                            folder_path = os.path.dirname(sp_path)
+                            if folder_path and folder_path not in created_folders:
+                                try:
+                                    folder_id = create_folder_safe(folder_path, drive_id, access_token)
+                                    if folder_id:
+                                        created_folders.add(folder_path)
+                                        logger.info(f"✅ Folder created: {folder_path}")
+                                    else:
+                                        raise Exception(f"Failed to create folder: {folder_path}")
+                                except Exception as e:
+                                    logger.error(f"❌ Folder creation failed {folder_path}: {str(e)}")
+                                    upload_logger.update_file_status(
+                                        local_path,
+                                        sp_path,
+                                        "error",
+                                        error=f"Folder creation failed: {str(e)}"
+                                    )
+                                    with counter_lock:
+                                        stats['processed'] += 1
+                                        stats['error'] += 1
+                                    return False
+
+                            # 2. 获取文件大小
+                            try:
+                                file_size = os.path.getsize(local_path)
+                            except Exception as e:
+                                logger.error(f"❌ Cannot get file size for {local_path}: {str(e)}")
+                                upload_logger.update_file_status(local_path, sp_path, "error", error=f"File size error: {str(e)}")
+                                return False
+                            
+                            # 3. 根据文件大小选择上传方式
+                            if file_size < 4 * 1024 * 1024:
+                                file_id = upload_small_file(local_path, sp_path, max_retries)
+                            else:
+                                file_id = upload_large_file(local_path, sp_path, file_size, max_retries)
+
+                            # 4. 如果上传成功，将metadata任务加入延迟队列而不是立即处理
+                            if file_id:
+                                source_item_data = file_metadata_map.get(filename)
+                                
+                                if source_item_data:
+                                    # 预处理metadata payload
+                                    final_metadata_payload = {}
+                                    for key, value in source_item_data.items():
+                                        if (key in expected_fields_keys or key == 'content_tag') and \
+                                           key not in METADATA_EXCLUSION_FIELDS and value is not None:
+                                            processed_key = str(key).replace(" ", "").replace("-", "_").replace(".", "_")
+                                            final_metadata_payload[processed_key] = value
+                                    
+                                    if final_metadata_payload:
+                                        # 将metadata更新任务添加到延迟队列
+                                        metadata_task = {
+                                            'file_id': file_id,
+                                            'filename': filename,
+                                            'local_path': local_path,
+                                            'sp_path': sp_path,
+                                            'metadata_payload': final_metadata_payload,
+                                            'upload_timestamp': time.time()
+                                        }
+                                        
+                                        with metadata_queue_lock:
+                                            metadata_update_queue.append(metadata_task)
+                                        
+                                        logger.info(f"📝 Metadata task queued for delayed processing: {filename} (ID: {file_id})")
+                                    else:
+                                        logger.info(f"No applicable metadata to update for {filename} (ID: {file_id})")
+                                else:
+                                    logger.warning(f"⚠️ No source metadata found for {filename} (ID: {file_id})")
+                            else:
+                                logger.error(f"❌ Upload failed for {local_path}, cannot attempt metadata update.")
+                            
                         except Exception as e:
-                            logger.error(f"❌ Folder creation failed {folder_path}: {str(e)}")
-                            upload_logger.update_file_status(
-                                local_path,
-                                sp_path,
-                                "error",
-                                error=f"Folder creation failed: {str(e)}"
-                            )
-                            with counter_lock:
-                                stats['processed'] += 1
-                                stats['error'] += 1
+                            logger.error(f"❌ Unexpected error in upload_single_file: {str(e)}")
+                            upload_logger.update_file_status(local_path, sp_path, "error", error=f"Unexpected error: {str(e)}")
                             return False
-
-                    # 2. 获取文件大小
-                    file_size = os.path.getsize(local_path)
                     
-                    # 3. 根据文件大小选择上传方式
-                    if file_size < 4 * 1024 * 1024:  # 小于4MB使用普通上传
-                        return upload_small_file(local_path, sp_path, max_retries)
-                    else:  # 大于4MB使用分块上传
-                        return upload_large_file(local_path, sp_path, file_size, max_retries)
+                    return file_id is not None
 
-                def upload_small_file(local_path, sp_path, max_retries=3):
-                    """上传小文件（<4MB）"""
+                def create_folder_safe(folder_path, drive_id, access_token, max_retries=3):
+                    """线程安全的文件夹创建函数"""
+                    import urllib.parse
+                    
                     for attempt in range(max_retries):
                         try:
-                            url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{sp_path}:/content"
-                            headers = {
-                                "Authorization": f"Bearer {access_token}",
-                                "Content-Type": "application/octet-stream"
+                            # URL编码处理
+                            encoded_path = urllib.parse.quote(folder_path, safe='/')
+                            check_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{encoded_path}"
+                            headers = {"Authorization": f"Bearer {access_token}"}
+                            
+                            # 检查文件夹是否已存在
+                            response = requests.get(check_url, headers=headers, timeout=30)
+                            if response.status_code == 200:
+                                return response.json().get('id')
+                            
+                            # 创建文件夹
+                            folder_name = os.path.basename(folder_path)
+                            parent_path = os.path.dirname(folder_path)
+                            
+                            if parent_path:
+                                encoded_parent = urllib.parse.quote(parent_path, safe='/')
+                                create_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{encoded_parent}:/children"
+                            else:
+                                create_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root/children"
+                            
+                            folder_data = {
+                                "name": folder_name,
+                                "folder": {},
+                                "@microsoft.graph.conflictBehavior": "replace"
                             }
-                            timeout = 30 * (attempt + 1)
-                            with open(local_path, "rb") as f:
-                                res = requests.put(url, headers=headers, data=f, timeout=timeout)
-                            if res.status_code in [200, 201, 202]:
-                                file_id = res.json().get('id')
+                            
+                            create_response = requests.post(
+                                create_url,
+                                headers={
+                                    "Authorization": f"Bearer {access_token}",
+                                    "Content-Type": "application/json"
+                                },
+                                json=folder_data,
+                                timeout=30
+                            )
+                            
+                            if create_response.status_code in [201, 200]:
+                                return create_response.json().get('id')
+                            elif create_response.status_code == 409:
+                                # 文件夹已存在，再次尝试获取
+                                response = requests.get(check_url, headers=headers, timeout=30)
+                                if response.status_code == 200:
+                                    return response.json().get('id')
+                            
+                            if attempt < max_retries - 1:
+                                wait_time = (attempt + 1) * 2
+                                logger.warning(f"⚠️ Folder creation retry {attempt+1}, waiting {wait_time}s")
+                                time.sleep(wait_time)
+                            else:
+                                logger.error(f"❌ Folder creation failed: {create_response.status_code} - {create_response.text}")
+                                return None
+                                
+                        except Exception as e:
+                            if attempt < max_retries - 1:
+                                wait_time = (attempt + 1) * 2
+                                logger.warning(f"⚠️ Folder creation error, retry {attempt+1}: {str(e)}")
+                                time.sleep(wait_time)
+                            else:
+                                logger.error(f"❌ Folder creation exception: {str(e)}")
+                                return None
+                    
+                    return None
+
+                def upload_small_file(local_path, sp_path, max_retries=3) -> Optional[str]:
+                    """上传小文件（<4MB），增强URL编码和冲突处理"""
+                    import urllib.parse
+                    
+                    # 1. 检查文件是否已存在
+                    try:
+                        encoded_sp_path = urllib.parse.quote(sp_path, safe='/')
+                        check_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{encoded_sp_path}"
+                        check_headers = {"Authorization": f"Bearer {access_token}"}
+                        
+                        check_response = requests.get(check_url, headers=check_headers, timeout=30)
+                        if check_response.status_code == 200:
+                            existing_file = check_response.json()
+                            existing_size = existing_file.get('size', 0)
+                            existing_id = existing_file.get('id')
+                            current_size = os.path.getsize(local_path)
+                            
+                            # 如果文件已存在且大小匹配，直接返回existing file_id
+                            if existing_size == current_size and existing_id:
+                                logger.info(f"📄 File already exists with same size, using existing: {os.path.basename(local_path)} (ID: {existing_id})")
                                 upload_logger.update_file_status(
                                     local_path,
                                     sp_path,
                                     "success",
-                                    file_id=file_id
+                                    file_id=existing_id
                                 )
-                                return file_id
+                                return existing_id
+                            else:
+                                logger.info(f"📄 File exists but size differs (existing: {existing_size}, new: {current_size}), will replace")
+                    except Exception as e:
+                        logger.info(f"ℹ️ File check failed (will proceed with upload): {str(e)}")
+                    
+                    # 2. 执行上传，带重试和冲突处理
+                    for attempt in range(max_retries):
+                        try:
+                            url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{encoded_sp_path}:/content"
+                            
+                            headers = {
+                                "Authorization": f"Bearer {access_token}",
+                                "Content-Type": "application/octet-stream"
+                            }
+                            
+                            # 动态超时
+                            timeout = min(120, 45 * (attempt + 1))
+                            
+                            with open(local_path, "rb") as f:
+                                res = requests.put(url, headers=headers, data=f, timeout=timeout)
+                            
+                            if res.status_code in [200, 201, 202]:
+                                response_data = res.json()
+                                file_id = response_data.get('id')
+                                if file_id:
+                                    upload_logger.update_file_status(
+                                        local_path,
+                                        sp_path,
+                                        "success",
+                                        file_id=file_id
+                                    )
+                                    logger.info(f"✅ File uploaded: {os.path.basename(local_path)} (ID: {file_id})")
+                                    return file_id
+                                else:
+                                    logger.warning(f"⚠️ Upload successful but no file_id in response")
+                            
+                            # 处理冲突情况
+                            elif res.status_code == 409:
+                                logger.info(f"ℹ️ File conflict detected, checking if completed by another process: {sp_path}")
+                                try:
+                                    # 等待一段时间让其他进程完成
+                                    time.sleep((attempt + 1) * 3)
+                                    
+                                    # 检查文件是否已被完成上传
+                                    final_check = requests.get(check_url, headers=check_headers, timeout=30)
+                                    if final_check.status_code == 200:
+                                        final_file = final_check.json()
+                                        final_size = final_file.get('size', 0)
+                                        final_id = final_file.get('id')
+                                        current_size = os.path.getsize(local_path)
+                                        
+                                        if final_size == current_size and final_id:
+                                            logger.info(f"✅ File completed by another process: {os.path.basename(local_path)} (ID: {final_id})")
+                                            upload_logger.update_file_status(local_path, sp_path, "success", file_id=final_id)
+                                            return final_id
+                                except Exception as e:
+                                    logger.warning(f"⚠️ Failed to check completed file: {str(e)}")
+                            
                             if attempt < max_retries - 1:
-                                wait_time = (2 ** attempt) + random.random()
-                                logger.warning(f"⚠️ Upload retry ({attempt+1}/{max_retries}): {res.status_code} - Waiting {wait_time:.1f} seconds")
+                                wait_time = (2 ** attempt) + random.uniform(1, 3)
+                                logger.warning(f"⚠️ Upload retry ({attempt+1}/{max_retries}) for {os.path.basename(local_path)}: {res.status_code}")
                                 time.sleep(wait_time)
                             else:
-                                error_message = f"Upload failed: {res.status_code} - {res.text}"
+                                error_message = f"Upload failed: {res.status_code} - {res.text[:300]}"
                                 logger.error(f"❌ {error_message}")
-                                upload_logger.update_file_status(
-                                    local_path,
-                                    sp_path,
-                                    "error",
-                                    error=error_message
-                                )
+                                upload_logger.update_file_status(local_path, sp_path, "error", error=error_message)
+                                
                         except Exception as e:
                             if attempt < max_retries - 1:
-                                wait_time = (2 ** attempt) + random.random()
+                                wait_time = (2 ** attempt) + random.uniform(1, 3)
                                 logger.warning(f"⚠️ Upload error, retry ({attempt+1}/{max_retries}): {str(e)}")
                                 time.sleep(wait_time)
                             else:
                                 error_message = f"Upload failed: {str(e)}"
                                 logger.error(f"❌ {error_message}")
-                                upload_logger.update_file_status(
-                                    local_path,
-                                    sp_path,
-                                    "error",
-                                    error=error_message
-                                )
+                                upload_logger.update_file_status(local_path, sp_path, "error", error=error_message)
+                    
                     return None
 
                 def upload_large_file(local_path, sp_path, file_size, max_retries=3):
-                    """分块上传大文件（>=4MB）"""
-                    # 1. 创建上传会话
+                    """分块上传大文件（>=4MB），增加冲突检测和处理"""
+                    import urllib.parse
+                    
+                    # 1. 检查文件是否已存在
+                    try:
+                        encoded_sp_path = urllib.parse.quote(sp_path, safe='/')
+                        check_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{encoded_sp_path}"
+                        check_headers = {"Authorization": f"Bearer {access_token}"}
+                        
+                        check_response = requests.get(check_url, headers=check_headers, timeout=30)
+                        if check_response.status_code == 200:
+                            existing_file = check_response.json()
+                            existing_size = existing_file.get('size', 0)
+                            existing_id = existing_file.get('id')
+                            
+                            # 如果文件已存在且大小匹配，直接返回existing file_id
+                            if existing_size == file_size and existing_id:
+                                logger.info(f"📄 File already exists with same size, using existing: {os.path.basename(local_path)} (ID: {existing_id})")
+                                upload_logger.update_file_status(
+                                    local_path,
+                                    sp_path,
+                                    "success",
+                                    file_id=existing_id
+                                )
+                                return existing_id
+                            else:
+                                logger.info(f"📄 File exists but size differs (existing: {existing_size}, new: {file_size}), will replace")
+                    except Exception as e:
+                        logger.info(f"ℹ️ File check failed (will proceed with upload): {str(e)}")
+                    
+                    # 2. 创建上传会话，带重试和冲突处理
                     upload_session = None
                     for attempt in range(max_retries):
                         try:
-                            create_session_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{sp_path}:/createUploadSession"
+                            create_session_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{encoded_sp_path}:/createUploadSession"
                             create_session_headers = {
                                 "Authorization": f"Bearer {access_token}",
                                 "Content-Type": "application/json"
                             }
                             create_session_body = {
                                 "@microsoft.graph.conflictBehavior": "replace",
-                                "description": "Large file upload"
+                                "description": f"Large file upload: {os.path.basename(local_path)}",
+                                "name": os.path.basename(sp_path)
                             }
                             
                             create_session_res = requests.post(
                                 create_session_url,
                                 headers=create_session_headers,
-                                json=create_session_body
+                                json=create_session_body,
+                                timeout=60
                             )
                             
                             if create_session_res.status_code == 200:
                                 upload_session = create_session_res.json()
+                                logger.info(f"✅ Upload session created for {os.path.basename(local_path)}")
                                 break
+                            elif create_session_res.status_code == 409:
+                                # 处理"nameAlreadyExists"错误
+                                error_info = create_session_res.json().get('error', {})
+                                if 'nameAlreadyExists' in error_info.get('code', ''):
+                                    logger.warning(f"⚠️ File currently being uploaded by another process, waiting...")
+                                    
+                                    # 等待其他进程完成上传
+                                    wait_time = (attempt + 1) * 10  # 递增等待时间
+                                    time.sleep(wait_time)
+                                    
+                                    # 检查文件是否已被其他进程上传完成
+                                    try:
+                                        final_check = requests.get(check_url, headers=check_headers, timeout=30)
+                                        if final_check.status_code == 200:
+                                            final_file = final_check.json()
+                                            final_size = final_file.get('size', 0)
+                                            final_id = final_file.get('id')
+                                            
+                                            if final_size == file_size and final_id:
+                                                logger.info(f"✅ File completed by another process: {os.path.basename(local_path)} (ID: {final_id})")
+                                                upload_logger.update_file_status(
+                                                    local_path,
+                                                    sp_path,
+                                                    "success",
+                                                    file_id=final_id
+                                                )
+                                                return final_id
+                                    except Exception:
+                                        pass
+                                        
+                                else:
+                                    logger.warning(f"⚠️ Conflict error (attempt {attempt+1}): {create_session_res.text}")
                             elif attempt < max_retries - 1:
-                                wait_time = (2 ** attempt) + random.random()
+                                wait_time = (2 ** attempt) + random.uniform(1, 3)
                                 logger.warning(f"⚠️ Create session retry ({attempt+1}/{max_retries}): {create_session_res.status_code}")
                                 time.sleep(wait_time)
                             else:
@@ -1540,7 +1841,7 @@ with col3:
                                 return None
                         except Exception as e:
                             if attempt < max_retries - 1:
-                                wait_time = (2 ** attempt) + random.random()
+                                wait_time = (2 ** attempt) + random.uniform(1, 3)
                                 logger.warning(f"⚠️ Create session error, retry ({attempt+1}/{max_retries}): {str(e)}")
                                 time.sleep(wait_time)
                             else:
@@ -1557,7 +1858,7 @@ with col3:
                     if not upload_session:
                         return None
 
-                    # 2. 分块上传
+                    # 3. 分块上传（保持原有逻辑）
                     upload_url = upload_session['uploadUrl']
                     
                     # 根据文件大小动态调整分块大小
@@ -1590,19 +1891,25 @@ with col3:
                                     upload_res = requests.put(
                                         upload_url,
                                         headers=headers,
-                                        data=chunk_data
+                                        data=chunk_data,
+                                        timeout=120
                                     )
                                     
                                     if upload_res.status_code in [201, 202]:
                                         # 上传完成
-                                        file_id = upload_res.json().get('id')
-                                        upload_logger.update_file_status(
-                                            local_path,
-                                            sp_path,
-                                            "success",
-                                            file_id=file_id
-                                        )
-                                        return file_id
+                                        if upload_res.status_code == 201:
+                                            file_id = upload_res.json().get('id')
+                                            logger.info(f"✅ Large file uploaded successfully: {os.path.basename(local_path)} (ID: {file_id})")
+                                            upload_logger.update_file_status(
+                                                local_path,
+                                                sp_path,
+                                                "success",
+                                                file_id=file_id
+                                            )
+                                            return file_id
+                                        else:
+                                            # 继续下一个块
+                                            break
                                     elif upload_res.status_code == 404:
                                         # 会话过期，需要重新创建
                                         logger.warning("Upload session expired, retrying...")
@@ -1612,7 +1919,7 @@ with col3:
                                         logger.warning(f"Chunk {chunk_index + 1}/{total_chunks} already uploaded, continuing...")
                                         break
                                     elif attempt < max_retries - 1:
-                                        wait_time = (2 ** attempt) + random.random()
+                                        wait_time = (2 ** attempt) + random.uniform(1, 3)
                                         logger.warning(f"⚠️ Chunk upload retry ({attempt+1}/{max_retries}): {upload_res.status_code}")
                                         time.sleep(wait_time)
                                     else:
@@ -1627,7 +1934,7 @@ with col3:
                                         return None
                                 except Exception as e:
                                     if attempt < max_retries - 1:
-                                        wait_time = (2 ** attempt) + random.random()
+                                        wait_time = (2 ** attempt) + random.uniform(1, 3)
                                         logger.warning(f"⚠️ Chunk upload error, retry ({attempt+1}/{max_retries}): {str(e)}")
                                         time.sleep(wait_time)
                                     else:
@@ -1654,18 +1961,9 @@ with col3:
                             uploaded_str = f"{uploaded_bytes/1024/1024:.1f} MB"
                             total_str = f"{file_size/1024/1024:.1f} MB"
                             
-                            # 更新日志
-                            logger.info(f"Uploading {os.path.basename(local_path)}: {progress:.1f}% ({uploaded_str}/{total_str}) - {speed_str}")
-                            
-                            # 更新上传状态
-                            upload_logger.update_file_status(
-                                local_path,
-                                sp_path,
-                                "uploading",
-                                progress=progress,
-                                uploaded_bytes=uploaded_bytes,
-                                total_bytes=file_size
-                            )
+                            # 更新日志（降低频率以避免日志过多）
+                            if chunk_index % 5 == 0 or chunk_index == total_chunks - 1:
+                                logger.info(f"Uploading {os.path.basename(local_path)}: {progress:.1f}% ({uploaded_str}/{total_str}) - {speed_str}")
                     
                     return None
 
@@ -1677,36 +1975,262 @@ with col3:
                 total_files = len(all_files)
 
                 # Dynamically adjust thread count based on file count
-                max_workers = min(20, max(10, total_files // 5))  # Minimum 10, Maximum 20 threads
+                max_workers = min(5, max(2, total_files // 10))  # 減少並發數
+                max_retries = 5  # 增加重試次數
 
                 # Use thread pool to concurrently upload all files
                 with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    # Submit all tasks
-                    futures = [executor.submit(upload_single_file, file_tuple) for file_tuple in all_files]
+                    # Submit all tasks, passing necessary parameters to upload_single_file
+                    # Ensure all_fields is defined in this scope; it's populated earlier when checking/creating fields.
+                    # If all_fields might not be populated (e.g., if no new fields needed creating),
+                    # initialize it to an empty dict or handle appropriately.
+                    # For now, assuming all_fields is available and has keys() method.
+                    # If fields_to_create was the source, ensure it's accessible or its keys are.
+                    # Let's assume `all_fields` (from line 1242) is the correct variable holding expected field names.
+                    # If `fields_to_create` was more appropriate, that should be used.
+                    # Based on previous context, `all_fields` seems to be the dictionary of all potential fields.
+                    
+                    # Ensure `expected_keys_for_metadata` is correctly defined.
+                    # `all_fields` is a dict where keys are field names.
+                    expected_keys_for_metadata = set(all_fields.keys())
+
+
+                    futures = [executor.submit(upload_single_file,
+                                               file_tuple,
+                                               file_metadata_mapping, # From Step 1
+                                               expected_keys_for_metadata, # Derived from all_fields
+                                               st.session_state.dest_manager # SharePointManager instance
+                                               ) for file_tuple in all_files]
 
                     # Process completed tasks
                     for future in concurrent.futures.as_completed(futures):
+                        upload_attempt_succeeded = False # Default to false for the current file processing in this iteration
                         try:
-                            future.result()  # Get result (exceptions will be raised here)
+                            # upload_single_file returns True if file_id was obtained (upload succeeded), False otherwise.
+                            upload_attempt_succeeded = future.result() 
+                            
                             # Display progress
                             with counter_lock:
+                                stats['processed'] += 1 # Increment processed files, regardless of this attempt's outcome
+                                
+                                # These stats are general counters for upload attempts.
+                                # Detailed success/failure including metadata is logged elsewhere or by upload_logger.
+                                if upload_attempt_succeeded:
+                                    stats['success'] +=1 # Count as a successful upload attempt
+                                else:
+                                    stats['error'] +=1   # Count as a failed upload attempt
+
                                 # Calculate progress as decimal (0-1)
-                                progress = stats['processed'] / stats['total']
-                                # Calculate percentage for display
-                                progress_percentage = progress * 100
-                                # Update progress bar with decimal value
-                                progress_bar.progress(progress)
-                                # Update status text with percentage
-                                status_text.text(f"Progress: {progress_percentage:.1f}% ({stats['processed']}/{stats['total']})")
+                                if stats['total'] > 0:
+                                    progress = stats['processed'] / stats['total']
+                                    # Calculate percentage for display
+                                    progress_percentage = progress * 100
+                                    # Update progress bar with decimal value
+                                    progress_bar.progress(progress)
+                                    # Update status text with percentage
+                                    status_text.text(f"Progress: {progress_percentage:.1f}% ({stats['processed']}/{stats['total']}) Success: {stats['success']}, Error: {stats['error']}")
+                                else:
+                                     status_text.text(f"No files to upload. Processed: {stats['processed']}/{stats['total']}")
+
                         except Exception as e:
-                            logger.error(f"❌ Task execution failed: {str(e)}")
-                            # Progress bar and status text will automatically update
+                            logger.error(f"❌ Task execution failed in ThreadPool: {str(e)}")
+                            with counter_lock: # Ensure stats are updated even if future.result() itself raises an unexpected error
+                                stats['processed'] += 1
+                                stats['error'] +=1
+                                if stats['total'] > 0:
+                                    progress = stats['processed'] / stats['total']
+                                    progress_percentage = progress * 100
+                                    progress_bar.progress(progress)
+                                    status_text.text(f"Progress: {progress_percentage:.1f}% ({stats['processed']}/{stats['total']}) Success: {stats['success']}, Error: {stats['error']}")
+                                else:
+                                    status_text.text(f"Task error. Processed: {stats['processed']}/{stats['total']}")
 
                 # Stop periodic log saving
                 upload_logger.stop_periodic_save()
 
                 # Final update and save log file
                 upload_logger.save_log()
+
+                # 添加延迟metadata处理
+                def process_delayed_metadata_updates():
+                    """处理延迟的metadata更新任务"""
+                    if not metadata_update_queue:
+                        logger.info("📝 No metadata tasks to process")
+                        return 0, 0
+                    
+                    total_tasks = len(metadata_update_queue)
+                    success_count = 0
+                    
+                    logger.info(f"📝 Processing {total_tasks} delayed metadata update tasks...")
+                    
+                    # 按上传时间排序，确保充分的等待时间
+                    metadata_update_queue.sort(key=lambda x: x['upload_timestamp'])
+                    
+                    for i, task in enumerate(metadata_update_queue):
+                        try:
+                            file_id = task['file_id']
+                            filename = task['filename']
+                            metadata_payload = task['metadata_payload']
+                            local_path = task['local_path']
+                            sp_path = task['sp_path']
+                            upload_time = task['upload_timestamp']
+                            
+                            # 确保每个文件至少等待30秒后再更新metadata
+                            elapsed_time = time.time() - upload_time
+                            min_wait_time = 30
+                            additional_wait = max(0, min_wait_time - elapsed_time)
+                            
+                            if additional_wait > 0:
+                                logger.info(f"⏳ [{i+1}/{total_tasks}] Waiting additional {additional_wait:.1f}s for indexing: {filename}")
+                                time.sleep(additional_wait)
+                            
+                            # 使用增强的重试策略更新metadata
+                            success = update_metadata_with_retry(
+                                file_id, 
+                                metadata_payload, 
+                                filename,
+                                drive_id,
+                                access_token,
+                                st.session_state.dest_manager
+                            )
+                            
+                            if success:
+                                success_count += 1
+                                logger.info(f"✅ [{i+1}/{total_tasks}] Metadata updated: {filename}")
+                                # 更新上传日志状态
+                                upload_logger.update_file_status(
+                                    local_path, 
+                                    sp_path, 
+                                    "success", 
+                                    file_id=file_id
+                                )
+                            else:
+                                logger.error(f"❌ [{i+1}/{total_tasks}] Metadata update failed: {filename}")
+                                upload_logger.update_file_status(
+                                    local_path, 
+                                    sp_path, 
+                                    "success_meta_error", 
+                                    file_id=file_id, 
+                                    error="Delayed metadata update failed after retries"
+                                )
+                                
+                        except Exception as e:
+                            logger.error(f"❌ Error processing metadata task {i+1}: {str(e)}")
+                    
+                    logger.info(f"📝 Metadata processing complete: {success_count}/{total_tasks} successful")
+                    return success_count, total_tasks
+
+                def update_metadata_with_retry(file_id, metadata_payload, filename, drive_id, access_token, sp_manager, max_attempts=5):
+                    """增强的metadata更新重试策略"""
+                    
+                    # 首先验证文件的可用性
+                    for verify_attempt in range(3):
+                        try:
+                            # 检查文件是否可通过Drive API访问
+                            verify_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{file_id}"
+                            verify_response = requests.get(
+                                verify_url,
+                                headers={"Authorization": f"Bearer {access_token}"},
+                                timeout=30
+                            )
+                            
+                            if verify_response.status_code == 200:
+                                # 检查ListItem是否可用（这是metadata更新的关键）
+                                listitem_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{file_id}/listItem"
+                                listitem_response = requests.get(
+                                    listitem_url,
+                                    headers={"Authorization": f"Bearer {access_token}"},
+                                    timeout=30
+                                )
+                                
+                                if listitem_response.status_code == 200:
+                                    logger.info(f"✅ File and ListItem verified for {filename}")
+                                    break
+                                else:
+                                    logger.warning(f"⚠️ ListItem not ready for {filename}: {listitem_response.status_code}")
+                                    if verify_attempt < 2:
+                                        time.sleep(5)
+                            else:
+                                logger.warning(f"⚠️ File not accessible: {verify_response.status_code}")
+                                if verify_attempt < 2:
+                                    time.sleep(3)
+                                
+                        except Exception as e:
+                            logger.warning(f"⚠️ Verification attempt {verify_attempt+1} failed: {str(e)}")
+                            if verify_attempt < 2:
+                                time.sleep(3)
+                    
+                    # 尝试多种metadata更新方法
+                    for attempt in range(max_attempts):
+                        # 方法1: 使用SharePointClient
+                        try:
+                            if sp_manager.update_file_metadata(file_id, metadata_payload):
+                                logger.info(f"✅ [Method1] Metadata updated via SharePointClient: {filename}")
+                                return True
+                        except Exception as e:
+                            logger.warning(f"⚠️ [Method1] SharePointClient failed: {str(e)}")
+                        
+                        # 方法2: 直接使用ListItem PATCH
+                        try:
+                            listitem_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{file_id}/listItem/fields"
+                            response = requests.patch(
+                                listitem_url,
+                                headers={
+                                    "Authorization": f"Bearer {access_token}",
+                                    "Content-Type": "application/json"
+                                },
+                                json=metadata_payload,
+                                timeout=60
+                            )
+                            
+                            if response.status_code == 200:
+                                logger.info(f"✅ [Method2] Metadata updated via ListItem PATCH: {filename}")
+                                return True
+                            else:
+                                logger.warning(f"⚠️ [Method2] ListItem PATCH failed: {response.status_code}")
+                        except Exception as e:
+                            logger.warning(f"⚠️ [Method2] ListItem PATCH exception: {str(e)}")
+                        
+                        # 方法3: 使用替代fields端点
+                        try:
+                            fields_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{file_id}/fields"
+                            response = requests.patch(
+                                fields_url,
+                                headers={
+                                    "Authorization": f"Bearer {access_token}",
+                                    "Content-Type": "application/json"
+                                },
+                                json=metadata_payload,
+                                timeout=60
+                            )
+                            
+                            if response.status_code == 200:
+                                logger.info(f"✅ [Method3] Metadata updated via fields endpoint: {filename}")
+                                return True
+                            else:
+                                logger.warning(f"⚠️ [Method3] Fields endpoint failed: {response.status_code}")
+                        except Exception as e:
+                            logger.warning(f"⚠️ [Method3] Fields endpoint exception: {str(e)}")
+                        
+                        # 如果所有方法都失败，等待后重试
+                        if attempt < max_attempts - 1:
+                            wait_time = min(15, (attempt + 1) * 5)
+                            logger.info(f"⏳ All methods failed, waiting {wait_time}s before retry {attempt+2}/{max_attempts}")
+                            time.sleep(wait_time)
+                    
+                    logger.error(f"❌ All metadata update attempts failed for {filename}")
+                    return False
+
+                # 执行延迟metadata处理
+                if metadata_update_queue:
+                    with st.spinner("📝 Processing delayed metadata updates..."):
+                        meta_success, meta_total = process_delayed_metadata_updates()
+                        
+                        if meta_total > 0:
+                            st.info(f"📝 Metadata processing completed: {meta_success}/{meta_total} successful")
+                        
+                        # 最终保存日志
+                        upload_logger.save_log()
 
                 # Clean up progress display
                 progress_bar.empty()
