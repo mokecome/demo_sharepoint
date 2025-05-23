@@ -1181,6 +1181,38 @@ with col3:
 
     def upload_target_to_sharepoint(resume_upload=False, log_file=None):
         """Upload the target folder structure and files to SharePoint, support breakpoint resume with log_file"""
+        # Define fields to exclude from metadata payload
+        METADATA_EXCLUSION_FIELDS = {
+            # Common SharePoint read-only or system-managed fields
+            'id', 'name', 'path', 'webUrl', 'web_url', 'createdDateTime', 'created_time', 
+            'lastModifiedDateTime', 'modified_time', 'size', 'parentReference', 
+            'contentType', 'ContentTag', '@odata.etag', 'eTag', 'createdBy', 'lastModifiedBy', 
+            'fileSystemInfo', 'folder', 'file', 'package', 'shared', 'sharing', 
+            'specialFolder', 'cTag', 'root', 'remoteItem', 'children', 'activities', 
+            'analytics', 'permissions', 'subscriptions', 'versions', 'thumbnails', 
+            'listItem', 'driveItem', 'searchResult', 'publication', 'bundle',
+            # Fields that might be in source but not directly updatable or relevant for new item
+            'AuthorLookupId', 'EditorLookupId', 'DocIcon', 'LinkFilenameNoMenu', 
+            'LinkFilename', 'ItemChildCount', 'FolderChildCount', 'AppAuthorLookupId', 
+            'AppEditorLookupId', '_ComplianceFlags', '_ComplianceTag', '_ComplianceTagWrittenTime',
+            '_ComplianceTagUserId', '_DisplayName', '_IsCurrentVersion', '_Level', '_ModerationComments',
+            '_ModerationStatus', '_UIVersion', '_UIVersionString', 'odata.context', 
+            'MediaServiceImageTags', 'ParentVersionStringLookupId', 'ParentLeafNameLookupId',
+            'BSN', 'FileDirRef', 'FileLeafRef', 'FileRef', 'FSObjType', 'GUID', 'InstanceID',
+            'MetaInfo', 'Order', 'ScopeId', 'SortBehavior', 'UniqueId', 'WorkflowInstanceID',
+            'WorkflowVersion', 'Modified_x0020_By', 'Created_x0020_By', 'CopySource',
+            'CheckoutUserLookupId', 'IsCheckedoutToLocal', 'LinkTitle', 'PrincipalCount',
+            'MediaServiceFastMetadata', 'MediaServiceGenerationTime',
+            'MediaServiceOCR', 'VirusStatus', '_EditMenuTableEnd', '_EditMenuTableStart',
+            # Fields from the provided fiter_list that should be excluded
+            'type', 'child_count', 'hash', 'download_url', 'FileSizeDisplay',
+            # Fields that are often problematic or managed by SharePoint
+            'ContentTypeId', 'GUID', 'Created', 'Modified', 'Author', 'Editor',
+            'Attachments', 'CheckedOutTitle', 'CheckoutUserId', 'File_x0020_Type',
+            'HTML_x0020_File_x0020_Type', 'TemplateUrl', 'xd_ProgID', 'xd_Signature',
+            # Specific to this application's logic, if any, that should not be set as metadata
+            'normalized_path', # This is used for lookup, not a SP field
+        }
         try:
             if not st.session_state.dest_manager or not st.session_state.dest_manager.get_access_token():
                 st.error("Please complete all target authentication information first")
@@ -1330,28 +1362,37 @@ with col3:
 
                 # Step 2: Optimized version of uploading files and writing tags
                 # Preload tag data to avoid repeated reading
-                tag_cache = {}
-                if os.path.exists('tag_result/merged_sharepoint_data.json'):
+                # Step 1: Identify Tag Data (Loading merged_sharepoint_data.json and populating file_metadata_mapping)
+                file_metadata_mapping: Dict[str, Dict[Any, Any]] = {}
+                merged_data_path = "tag_result/merged_sharepoint_data.json"
+                logger.info(f"Attempting to load tag data from {merged_data_path}")
+                if os.path.exists(merged_data_path):
                     try:
-                        with open('tag_result/merged_sharepoint_data.json', 'r', encoding='utf-8') as f:
+                        with open(merged_data_path, 'r', encoding='utf-8') as f:
                             merged_data = json.load(f)
-                        logger.info(f"✅ Tag data loaded, {len(merged_data)} records")
+                        logger.info(f"✅ Successfully loaded {merged_data_path}, containing {len(merged_data)} items.")
 
-                        # Create efficient lookup dictionary
                         for item in merged_data:
-                            item_path = item.get("path", "").replace('\\', '/').strip('/')
-                            if item_path:
-                                tag_cache[item_path] = item.get("content_tag", "")
-                            # Also add filename as fallback match
-                            name = item.get("name", "")
-                            if name and name not in tag_cache:
-                                tag_cache[name] = item.get("content_tag", "")
-                            # Add normalized_path
-                            norm_path = item.get("normalized_path", "")
-                            if norm_path and norm_path not in tag_cache:
-                                tag_cache[norm_path] = item.get("content_tag", "")
+                            if item.get('type') == 'file':
+                                filename = item.get("name")
+                                if not filename:
+                                    logger.warning(f"⚠️ Item found with no name, skipping: {item}")
+                                    continue
+
+                                if filename in file_metadata_mapping:
+                                    logger.warning(f"⚠️ Duplicate filename found: '{filename}'. Overwriting with new item. Old: {file_metadata_mapping[filename]}, New: {item}")
+                                file_metadata_mapping[filename] = item
+                            # else: # Optionally log skipped non-file items
+                                # logger.debug(f"Skipping non-file item: {item.get('name')}")
+                        
+                        logger.info(f"✅ Populated file_metadata_mapping with {len(file_metadata_mapping)} file entries.")
+
+                    except json.JSONDecodeError as e:
+                        logger.error(f"❌ Error decoding JSON from {merged_data_path}: {str(e)}")
                     except Exception as e:
-                        logger.error(f"❌ Tag data loading failed: {str(e)}")
+                        logger.error(f"❌ An unexpected error occurred while loading or processing {merged_data_path}: {str(e)}")
+                else:
+                    logger.error(f"❌ Tag data file not found: {merged_data_path}. Cannot populate file_metadata_mapping.")
 
                 # Collect all files to upload
                 all_files = []
@@ -1418,8 +1459,9 @@ with col3:
                 upload_logger.start_periodic_save(30)
 
                 # Define function to upload single file (with exponential backoff)
-                def upload_single_file(file_tuple, max_retries=3):
+                def upload_single_file(file_tuple, file_metadata_map, expected_fields_keys, sp_manager, max_retries=3):
                     local_path, sp_path = file_tuple
+                    file_id = None # Initialize file_id
                     
                     # 1. 确保文件夹存在
                     folder_path = os.path.dirname(sp_path)
@@ -1445,12 +1487,66 @@ with col3:
                     
                     # 3. 根据文件大小选择上传方式
                     if file_size < 4 * 1024 * 1024:  # 小于4MB使用普通上传
-                        return upload_small_file(local_path, sp_path, max_retries)
+                        file_id = upload_small_file(local_path, sp_path, max_retries)
                     else:  # 大于4MB使用分块上传
-                        return upload_large_file(local_path, sp_path, file_size, max_retries)
+                        file_id = upload_large_file(local_path, sp_path, file_size, max_retries)
 
-                def upload_small_file(local_path, sp_path, max_retries=3):
-                    """上传小文件（<4MB）"""
+                    # After file upload, attempt to update metadata if file_id was obtained
+                    if file_id:
+                        filename = os.path.basename(local_path)
+                        source_item_data = file_metadata_map.get(filename)
+
+                        if source_item_data:
+                            final_metadata_payload = {}
+                            for key, value in source_item_data.items():
+                                # Include if in expected_fields_keys OR is 'content_tag'
+                                # AND not in METADATA_EXCLUSION_FIELDS AND value is not None
+                                if (key in expected_fields_keys or key == 'content_tag') and \
+                                   key not in METADATA_EXCLUSION_FIELDS and value is not None:
+                                    # Ensure key is string and suitable for SharePoint field name
+                                    # SharePoint internal field names usually don't have spaces or special chars
+                                    # This part might need more robust key transformation if source keys are very different
+                                    processed_key = str(key).replace(" ", "") # Basic sanitization
+                                    final_metadata_payload[processed_key] = value
+                            
+                            if final_metadata_payload:
+                                logger.info(f"Attempting to update metadata for file: {filename} (ID: {file_id}) with payload: {final_metadata_payload}")
+                                try:
+                                    update_success = sp_manager.update_file_metadata(file_id, final_metadata_payload)
+                                    if update_success:
+                                        logger.info(f"✅ Successfully updated metadata for {filename} (ID: {file_id})")
+                                        # The upload_logger status remains 'success' if only metadata update is successful after file upload.
+                                    else:
+                                        logger.error(f"❌ Metadata update API call failed for {filename} (ID: {file_id}). SharePointClient should have logged details.")
+                                        upload_logger.update_file_status(local_path, sp_path, "success_meta_error", file_id=file_id, error="Metadata update API call failed.")
+                                except Exception as e:
+                                    logger.error(f"❌ Exception during metadata update for {filename} (ID: {file_id}): {str(e)}", exc_info=True)
+                                    upload_logger.update_file_status(local_path, sp_path, "success_meta_exception", file_id=file_id, error=f"Exception: {str(e)[:100]}")
+                            else:
+                                logger.info(f"No applicable metadata to update for {filename} (ID: {file_id}) after filtering. File uploaded successfully.")
+                                # Status in upload_logger remains 'success' from the file upload if no metadata was to be applied.
+                        else:
+                            logger.warning(f"⚠️ No source metadata found in file_metadata_map for {filename} (ID: {file_id}). File uploaded, but skipping metadata update.")
+                            upload_logger.update_file_status(local_path, sp_path, "success_meta_skipped", file_id=file_id, error="Source metadata not found.")
+                    else: # if file_id is None
+                        # This case is already handled by upload_small_file/upload_large_file setting status to "error" in upload_logger
+                        logger.error(f"Upload failed for {local_path}, cannot attempt metadata update.")
+                    
+                    # Return file_id (which could be None if upload failed) to correctly update stats
+                    # The original logic for stats update based on upload_small_file/upload_large_file return should remain.
+                    # This function's primary return (True/False) was implicitly based on whether upload succeeded.
+                    # This function's role is to perform the upload and then attempt metadata update.
+                    # The success/failure of the upload itself is logged by upload_logger.
+                    # The success/failure of the metadata update is logged here.
+                    # The main loop's stats will primarily reflect upload attempts based on logger.
+                    # No explicit boolean return needed here for stats if upload_logger is the source of truth for upload status.
+                    # However, the existing ThreadPoolExecutor loop expects a result to update general counters.
+                    # Let's return True if the upload part was successful (file_id obtained), False otherwise.
+                    # This will allow the main loop to count overall successful uploads vs. failed uploads.
+                    return file_id is not None
+
+                def upload_small_file(local_path, sp_path, max_retries=3) -> Optional[str]:
+                    """上传小文件（<4MB）, returns file_id on success, None on failure"""
                     for attempt in range(max_retries):
                         try:
                             url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{sp_path}:/content"
@@ -1681,26 +1777,70 @@ with col3:
 
                 # Use thread pool to concurrently upload all files
                 with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    # Submit all tasks
-                    futures = [executor.submit(upload_single_file, file_tuple) for file_tuple in all_files]
+                    # Submit all tasks, passing necessary parameters to upload_single_file
+                    # Ensure all_fields is defined in this scope; it's populated earlier when checking/creating fields.
+                    # If all_fields might not be populated (e.g., if no new fields needed creating),
+                    # initialize it to an empty dict or handle appropriately.
+                    # For now, assuming all_fields is available and has keys() method.
+                    # If fields_to_create was the source, ensure it's accessible or its keys are.
+                    # Let's assume `all_fields` (from line 1242) is the correct variable holding expected field names.
+                    # If `fields_to_create` was more appropriate, that should be used.
+                    # Based on previous context, `all_fields` seems to be the dictionary of all potential fields.
+                    
+                    # Ensure `expected_keys_for_metadata` is correctly defined.
+                    # `all_fields` is a dict where keys are field names.
+                    expected_keys_for_metadata = set(all_fields.keys())
+
+
+                    futures = [executor.submit(upload_single_file,
+                                               file_tuple,
+                                               file_metadata_mapping, # From Step 1
+                                               expected_keys_for_metadata, # Derived from all_fields
+                                               st.session_state.dest_manager # SharePointManager instance
+                                               ) for file_tuple in all_files]
 
                     # Process completed tasks
                     for future in concurrent.futures.as_completed(futures):
+                        upload_attempt_succeeded = False # Default to false for the current file processing in this iteration
                         try:
-                            future.result()  # Get result (exceptions will be raised here)
+                            # upload_single_file returns True if file_id was obtained (upload succeeded), False otherwise.
+                            upload_attempt_succeeded = future.result() 
+                            
                             # Display progress
                             with counter_lock:
+                                stats['processed'] += 1 # Increment processed files, regardless of this attempt's outcome
+                                
+                                # These stats are general counters for upload attempts.
+                                # Detailed success/failure including metadata is logged elsewhere or by upload_logger.
+                                if upload_attempt_succeeded:
+                                    stats['success'] +=1 # Count as a successful upload attempt
+                                else:
+                                    stats['error'] +=1   # Count as a failed upload attempt
+
                                 # Calculate progress as decimal (0-1)
-                                progress = stats['processed'] / stats['total']
-                                # Calculate percentage for display
-                                progress_percentage = progress * 100
-                                # Update progress bar with decimal value
-                                progress_bar.progress(progress)
-                                # Update status text with percentage
-                                status_text.text(f"Progress: {progress_percentage:.1f}% ({stats['processed']}/{stats['total']})")
+                                if stats['total'] > 0:
+                                    progress = stats['processed'] / stats['total']
+                                    # Calculate percentage for display
+                                    progress_percentage = progress * 100
+                                    # Update progress bar with decimal value
+                                    progress_bar.progress(progress)
+                                    # Update status text with percentage
+                                    status_text.text(f"Progress: {progress_percentage:.1f}% ({stats['processed']}/{stats['total']}) Success: {stats['success']}, Error: {stats['error']}")
+                                else:
+                                     status_text.text(f"No files to upload. Processed: {stats['processed']}/{stats['total']}")
+
                         except Exception as e:
-                            logger.error(f"❌ Task execution failed: {str(e)}")
-                            # Progress bar and status text will automatically update
+                            logger.error(f"❌ Task execution failed in ThreadPool: {str(e)}")
+                            with counter_lock: # Ensure stats are updated even if future.result() itself raises an unexpected error
+                                stats['processed'] += 1
+                                stats['error'] +=1
+                                if stats['total'] > 0:
+                                    progress = stats['processed'] / stats['total']
+                                    progress_percentage = progress * 100
+                                    progress_bar.progress(progress)
+                                    status_text.text(f"Progress: {progress_percentage:.1f}% ({stats['processed']}/{stats['total']}) Success: {stats['success']}, Error: {stats['error']}")
+                                else:
+                                    status_text.text(f"Task error. Processed: {stats['processed']}/{stats['total']}")
 
                 # Stop periodic log saving
                 upload_logger.stop_periodic_save()
